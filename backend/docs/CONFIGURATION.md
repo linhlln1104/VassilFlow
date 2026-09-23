@@ -1,595 +1,137 @@
-# Configuration Guide
+# Backend configuration
 
-The base distribution has no built-in product Agents or product-specific tool
-configuration. Configure models, tools, skills, and runtime features for the
-general agent or personal Agents. Server-owned capability adapters and repository
-contracts remain available when adding a domain extension.
+The canonical schema is [AppConfig](../packages/harness/vassilflow/config/app_config.py), with section models in [config/](../packages/harness/vassilflow/config/). The annotated [config.example.yaml](../../config.example.yaml) is a starting configuration, not a statement that every displayed feature is enabled by default. Its current `config_version` is 21.
 
-This guide explains how to configure VassilFlow for your environment.
+## Loading order
 
-## Config Versioning
+`AppConfig.from_file()` selects an explicit path first, then `VASSILFLOW_CONFIG_PATH`, then `config.yaml` under the caller's project root. Repository compatibility fallbacks search the backend/repository locations. Pin the path when embedding the harness or running a service from a different directory.
 
-`config.example.yaml` contains a `config_version` field that tracks schema changes. When the example version is higher than your local `config.yaml`, the application emits a startup warning:
+`VASSILFLOW_PROJECT_ROOT` sets the caller project root; otherwise it is the current working directory. `.env` loading and `$VARIABLE` substitution supply secret values. A configuration string beginning with `$` is resolved as an environment reference; missing variables fail configuration loading. This is not shell expansion. Keep secret-bearing local files out of version control.
 
-```
-WARNING - Your config.yaml (version 0) is outdated — the latest version is 1.
-Run `make config-upgrade` to merge new fields into your config.
-```
+Most missing optional sections use their Pydantic defaults. A required `sandbox` section must be valid. Unknown top-level fields are allowed for extension configuration, so a misspelled optional key may not fail validation.
 
-- **Missing `config_version`** in your config is treated as version 0.
-- Run `make config-upgrade` to auto-merge missing fields and apply versioned config rewrites for provider and tool class paths (your existing values are preserved where no migration rule matches, and a `.bak` backup is created).
-- When changing the config schema, bump `config_version` in `config.example.yaml`.
+## Minimal configuration
 
-Version 21 removes tools that import the retired `vassilflow.community.office.*`
-or `src.community.office.*` modules. Custom tools with the same names and other
-import paths are preserved. Generic document uploads and text conversion remain
-available.
-
-## Configuration Sections
-
-### Extensions
-
-MCP servers and skill enabled states live in `extensions_config.json`. A server
-or individual MCP tool can define soft `routing` hints for requests that should
-prefer it. See [MCP Configuration](MCP_SERVER.md#routing-hints) for the schema
-and the boundary between routing hints and hard tool policy.
-
-### Models
-
-Configure the LLM models available to the agent:
+This local example uses a placeholder model identifier. Replace `your-provider-model` with a model supported by your provider and supply `OPENAI_API_KEY` before starting:
 
 ```yaml
+config_version: 21
 models:
-  - name: gpt-4                    # Internal identifier
-    display_name: GPT-4            # Human-readable name
-    use: langchain_openai:ChatOpenAI  # LangChain class path
-    model: gpt-4                   # Model identifier for API
-    api_key: $OPENAI_API_KEY       # API key (use env var)
-    max_tokens: 4096               # Max tokens per request
-    temperature: 0.7               # Sampling temperature
-```
-
-**Supported Providers**:
-- OpenAI (`langchain_openai:ChatOpenAI`)
-- Anthropic (`langchain_anthropic:ChatAnthropic`)
-- DeepSeek (`langchain_deepseek:ChatDeepSeek`)
-- Xiaomi MiMo (`vassilflow.models.patched_mimo:PatchedChatMiMo`)
-- Claude Code OAuth (`vassilflow.models.claude_provider:ClaudeChatModel`)
-- Codex CLI (`vassilflow.models.openai_codex_provider:CodexChatModel`)
-- Any LangChain-compatible provider
-
-CLI-backed provider examples:
-
-```yaml
-models:
-  - name: gpt-5.4
-    display_name: GPT-5.4 (Codex CLI)
-    use: vassilflow.models.openai_codex_provider:CodexChatModel
-    model: gpt-5.4
-    supports_thinking: true
-    supports_reasoning_effort: true
-
-  - name: gpt-5-3-codex-spark
-    display_name: GPT-5.3-Codex-Spark
-    use: vassilflow.models.openai_codex_provider:CodexChatModel
-    model: gpt-5.3-codex-spark
-    reasoning_summary: none
-    supports_thinking: true
-    supports_reasoning_effort: true
-
-  - name: claude-sonnet-4.6
-    display_name: Claude Sonnet 4.6 (Claude Code OAuth)
-    use: vassilflow.models.claude_provider:ClaudeChatModel
-    model: claude-sonnet-4-6
-    max_tokens: 4096
-    supports_thinking: true
-```
-
-**Auth behavior for CLI-backed providers**:
-- `CodexChatModel` loads Codex CLI auth from `~/.codex/auth.json`
-- The Codex Responses endpoint currently rejects `max_tokens` and `max_output_tokens`, so `CodexChatModel` does not expose a request-level token cap
-- Some Codex models reject reasoning summaries. Set `reasoning_summary: none` for those models while keeping `reasoning_effort` enabled
-- `ClaudeChatModel` accepts `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_CREDENTIALS_PATH`, or plaintext `~/.claude/.credentials.json`
-- On macOS, VassilFlow does not probe Keychain automatically. Use `scripts/export_claude_code_oauth.py` to export Claude Code auth explicitly when needed
-
-To use OpenAI's `/v1/responses` endpoint with LangChain, keep using `langchain_openai:ChatOpenAI` and set:
-
-```yaml
-models:
-  - name: gpt-5-responses
-    display_name: GPT-5 (Responses API)
+  - name: primary
     use: langchain_openai:ChatOpenAI
-    model: gpt-5
+    model: your-provider-model
     api_key: $OPENAI_API_KEY
-    use_responses_api: true
-    output_version: responses/v1
-```
-
-For OpenAI-compatible gateways (for example Novita or OpenRouter), keep using `langchain_openai:ChatOpenAI` and set `base_url`:
-
-```yaml
-models:
-  - name: novita-deepseek-v3.2
-    display_name: Novita DeepSeek V3.2
-    use: langchain_openai:ChatOpenAI
-    model: deepseek/deepseek-v3.2
-    api_key: $NOVITA_API_KEY
-    base_url: https://api.novita.ai/openai
-    supports_thinking: true
-    when_thinking_enabled:
-      extra_body:
-        thinking:
-          type: enabled
-
-  - name: minimax-m3
-    display_name: MiniMax M3
-    use: langchain_openai:ChatOpenAI
-    model: MiniMax-M3
-    api_key: $MINIMAX_API_KEY
-    base_url: https://api.minimax.io/v1
-    max_tokens: 4096
-    temperature: 1.0  # MiniMax requires temperature in (0.0, 1.0]
-    supports_vision: true
-
-  - name: minimax-m2.7
-    display_name: MiniMax M2.7
-    use: langchain_openai:ChatOpenAI
-    model: MiniMax-M2.7
-    api_key: $MINIMAX_API_KEY
-    base_url: https://api.minimax.io/v1
-    max_tokens: 4096
-    temperature: 1.0  # MiniMax requires temperature in (0.0, 1.0]
-    supports_vision: false  # M2.7 is text-only; M3 supports vision
-
-  - name: minimax-m2.7-highspeed
-    display_name: MiniMax M2.7 Highspeed
-    use: langchain_openai:ChatOpenAI
-    model: MiniMax-M2.7-highspeed
-    api_key: $MINIMAX_API_KEY
-    base_url: https://api.minimax.io/v1
-    max_tokens: 4096
-    temperature: 1.0  # MiniMax requires temperature in (0.0, 1.0]
-    supports_vision: false  # M2.7 is text-only; M3 supports vision
-  - name: openrouter-gemini-2.5-flash
-    display_name: Gemini 2.5 Flash (OpenRouter)
-    use: langchain_openai:ChatOpenAI
-    model: google/gemini-2.5-flash-preview
-    api_key: $OPENAI_API_KEY
-    base_url: https://openrouter.ai/api/v1
-```
-
-If your OpenRouter key lives in a different environment variable name, point `api_key` at that variable explicitly (for example `api_key: $OPENROUTER_API_KEY`).
-
-**Thinking Models**:
-Some models support "thinking" mode for complex reasoning:
-
-```yaml
-models:
-  - name: deepseek-v4
-    supports_thinking: true
-    when_thinking_enabled:
-      extra_body:
-        thinking:
-          type: enabled
-```
-
-**Gemini with thinking via OpenAI-compatible gateway**:
-
-When routing Gemini through an OpenAI-compatible proxy (Vertex AI OpenAI compat endpoint, AI Studio, or third-party gateways) with thinking enabled, the API attaches a `thought_signature` to each tool-call object returned in the response.  Every subsequent request that replays those assistant messages **must** echo those signatures back on the tool-call entries or the API returns:
-
-```
-HTTP 400 INVALID_ARGUMENT: function call `<tool>` in the N. content block is
-missing a `thought_signature`.
-```
-
-Standard `langchain_openai:ChatOpenAI` silently drops `thought_signature` when serialising messages.  Use `vassilflow.models.patched_openai:PatchedChatOpenAI` instead — it re-injects the tool-call signatures (sourced from `AIMessage.additional_kwargs["tool_calls"]`) into every outgoing payload:
-
-```yaml
-models:
-  - name: gemini-2.5-pro-thinking
-    display_name: Gemini 2.5 Pro (Thinking)
-    use: vassilflow.models.patched_openai:PatchedChatOpenAI
-    model: google/gemini-2.5-pro-preview   # model name as expected by your gateway
-    api_key: $GEMINI_API_KEY
-    base_url: https://<your-openai-compat-gateway>/v1
-    max_tokens: 16384
-    supports_thinking: true
-    supports_vision: true
-    when_thinking_enabled:
-      extra_body:
-        thinking:
-          type: enabled
-```
-
-For Gemini accessed **without** thinking (e.g. via OpenRouter where thinking is not activated), the plain `langchain_openai:ChatOpenAI` with `supports_thinking: false` is sufficient and no patch is needed.
-
-**MiMo with thinking via OpenAI-compatible API**:
-
-MiMo returns `reasoning_content` on assistant messages in thinking mode. In multi-turn agent conversations with tool calls, subsequent requests must preserve that historical `reasoning_content` on assistant messages or the MiMo API can return HTTP 400. Standard `langchain_openai:ChatOpenAI` drops this provider-specific field, so use `vassilflow.models.patched_mimo:PatchedChatMiMo`:
-
-For pay-as-you-go API keys (`sk-...`), use `https://api.xiaomimimo.com/v1`. For Token Plan keys (`tp-...`), use the regional Token Plan Base URL shown in the MiMo console, such as `https://token-plan-cn.xiaomimimo.com/v1`. MiMo documents these key types as separate and non-interchangeable.
-
-`PatchedChatMiMo` is model-id agnostic. Use it for every MiMo thinking model entry you configure, including model entries referenced by `subagents.*.model` overrides (for example `mimo-v2.5-pro`, `mimo-v2.5`, `mimo-v2-pro`, `mimo-v2-omni`, or `mimo-v2-flash`).
-
-```yaml
-models:
-  - name: mimo-v2.5-pro
-    display_name: MiMo V2.5 Pro
-    use: vassilflow.models.patched_mimo:PatchedChatMiMo
-    model: mimo-v2.5-pro
-    api_key: $MIMO_API_KEY
-    base_url: https://api.xiaomimimo.com/v1
-    max_tokens: 8192
-    supports_thinking: true
-    supports_vision: false
-    when_thinking_enabled:
-      extra_body:
-        thinking:
-          type: enabled
-    when_thinking_disabled:
-      extra_body:
-        thinking:
-          type: disabled
-```
-
-`PatchedChatMiMo` preserves MiMo's `choices[].message.reasoning_content`, streaming `delta.reasoning_content`, and request-history assistant `reasoning_content` fields. It does not reuse the DeepSeek provider.
-
-**Optional Pricing Metadata**:
-
-The operations console can estimate spend when model entries include a
-`pricing` metadata block. This block is consumed by `/api/console/*` only; it is
-not forwarded to the model provider.
-
-```yaml
-models:
-  - name: minimax-m2
-    display_name: MiniMax M2
-    use: langchain_openai:ChatOpenAI
-    model: MiniMax-M2
-    api_key: $MINIMAX_API_KEY
-    base_url: https://api.minimax.io/v1
-    pricing:
-      currency: CNY
-      input_per_million: 8
-      output_per_million: 32
-      input_cache_hit_per_million: 0.8
-```
-
-`input_cache_hit_per_million` is optional. If it is omitted, cache-hit input
-tokens are conservatively billed at the normal input price.
-
-### Tool Groups
-
-Organize tools into logical groups:
-
-```yaml
-tool_groups:
-  - name: web          # Web browsing and search
-  - name: file:read    # Read-only file operations
-  - name: file:write   # Write file operations
-  - name: bash         # Shell command execution
-```
-
-### Tools
-
-Configure specific tools available to the agent:
-
-```yaml
-tools:
-  - name: web_search
-    group: web
-    use: vassilflow.community.tavily.tools:web_search_tool
-    max_results: 5
-    # api_key: $TAVILY_API_KEY  # Optional
-```
-
-**Built-in Tools**:
-- `web_search` - Search the web (DuckDuckGo, Tavily, Brave, Exa, InfoQuest, Firecrawl, fastCRW, GroundRoute)
-- `web_fetch` - Fetch web pages (Jina AI, Exa, InfoQuest, Firecrawl, fastCRW, GroundRoute)
-- `image_search` - Search for reference images (DuckDuckGo, InfoQuest, Serper)
-- `ls` - List directory contents
-- `read_file` - Read file contents
-- `write_file` - Write file contents
-- `str_replace` - String replacement in files
-- `bash` - Execute bash commands
-
-### Sandbox
-
-VassilFlow supports multiple sandbox execution modes. Configure your preferred mode in `config.yaml`:
-
-**Local Execution** (runs sandbox code directly on the host machine):
-```yaml
-sandbox:
-   use: vassilflow.sandbox.local:LocalSandboxProvider # Local execution
-   allow_host_bash: false # default; host bash is disabled unless explicitly re-enabled
-```
-
-**Docker Execution** (runs sandbox code in isolated Docker containers):
-```yaml
-sandbox:
-   use: vassilflow.community.aio_sandbox:AioSandboxProvider # Docker-based sandbox
-```
-
-**Docker Execution with Kubernetes** (runs sandbox code in Kubernetes pods via provisioner service):
-
-This mode runs each sandbox in an isolated Kubernetes Pod on your **host machine's cluster**. Requires Docker Desktop K8s, OrbStack, or similar local K8s setup.
-
-```yaml
-sandbox:
-   use: vassilflow.community.aio_sandbox:AioSandboxProvider
-   provisioner_url: http://provisioner:8002
-```
-
-When using Docker development (`make docker-start`), VassilFlow starts the `provisioner` service only if this provisioner mode is configured. In local or plain Docker sandbox modes, `provisioner` is skipped.
-
-See [Provisioner Setup Guide](../../docker/provisioner/README.md) for detailed configuration, prerequisites, and troubleshooting.
-
-Choose between local execution or Docker-based isolation:
-
-**Option 1: Local Sandbox** (default, simpler setup):
-```yaml
 sandbox:
   use: vassilflow.sandbox.local:LocalSandboxProvider
-  allow_host_bash: false
+database:
+  backend: sqlite
+  sqlite_dir: .vassilflow/data
+run_events:
+  backend: db
 ```
 
-`allow_host_bash` is intentionally `false` by default. VassilFlow's local sandbox is a host-side convenience mode, not a secure shell isolation boundary. If you need `bash`, prefer `AioSandboxProvider`. Only set `allow_host_bash: true` for fully trusted single-user local workflows.
+Run Gateway from `backend/` for this relative SQLite directory to resolve to `backend/.vassilflow/data`. A database filename of `vassilflow.db` is appended. `database.backend` supports `memory`, `sqlite`, and `postgres`.
 
-**Option 2: Docker Sandbox** (isolated, more secure):
-```yaml
-sandbox:
-  use: vassilflow.community.aio_sandbox:AioSandboxProvider
-  port: 8080
-  auto_start: true
-  container_prefix: vassilflow-sandbox
+There are two distinct defaults: constructing `DatabaseConfig()` in Python defaults to `memory`; loading a config file with the database section absent defaults to `sqlite`. Run events separately default to `memory`, so select `run_events.backend: db` or `jsonl` if event history must survive a restart. Checkpoints, run events, and filesystem artifacts are different stores.
 
-  # Optional: Additional mounts
-  mounts:
-    - host_path: /path/on/host
-      container_path: /path/in/container
-      read_only: false
-```
+## Models and tools
 
-When you configure `sandbox.mounts`, VassilFlow exposes those `container_path` values in the agent prompt so the agent can discover and operate on mounted directories directly instead of assuming everything must live under `/mnt/user-data`.
+A model's `name` is the configuration lookup key used by requests, title generation, memory, summarization, and subagents. `use` is an importable `module:object` adapter. Remaining provider arguments, supported capabilities, and credential loading are adapter-specific; see [model_config.py](../packages/harness/vassilflow/config/model_config.py) and [models/](../packages/harness/vassilflow/models/). Do not assume every adapter supports every provider option.
 
-For bare-metal Docker sandbox runs that use localhost, VassilFlow binds the sandbox HTTP port to `127.0.0.1` by default so it is not exposed on every host interface. Docker-outside-of-Docker deployments that connect through `host.docker.internal` keep a broader bind for container-to-host routing. Set `VASSILFLOW_SANDBOX_BIND_HOST` explicitly if your deployment needs a different bind address.
+Tools use importable `use` paths and named tool groups. Keep new product-specific implementations in your application package and register them through configuration or the agent factory. Generic file tools, web integrations, MCP, skills, and subagent delegation do not require an Office product module.
 
-### Building a Custom AIO Sandbox Image
+The Codex and Claude model adapters can use their respective local credential loaders. Their presence in a host home directory does not make those credentials available inside Docker. Inspect the optional Compose credential mounts before enabling them; the default stack does not mount the entire host credential directories.
 
-`AioSandboxProvider` talks to the sandbox container through the `agent-sandbox` SDK. The Dockerfile for the default `enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest` image is not part of this repository; VassilFlow treats that image as an external AIO sandbox runtime.
+## Section reference
 
-For persistent system or language dependencies, extend the published image and keep its startup command intact:
+The table describes code defaults, unless explicitly identified as an example-file choice. Follow each source link for complete fields and constraints.
 
-```dockerfile
-FROM enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
+| Section                | Purpose and default behavior                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `log_level`            | `info`; startup logging configuration                                                                                    |
+| `max_recursion_limit`  | `1000`; graph recursion ceiling                                                                                          |
+| `models`               | Configured model list; empty in the base schema                                                                          |
+| `sandbox`              | Required provider configuration; example uses the local provider                                                         |
+| `tools`, `tool_groups` | Tool imports and grouping                                                                                                |
+| `skills`               | Skill directories and container paths; [schema](../packages/harness/vassilflow/config/skills_config.py)                  |
+| `skill_scan`           | Scanning and skill-content limits; [schema](../packages/harness/vassilflow/config/skill_scan_config.py)                  |
+| `skill_evolution`      | Skill change workflow; [schema](../packages/harness/vassilflow/config/skill_evolution_config.py)                         |
+| `extensions`           | Extension configuration loading; [MCP guide](MCP_SERVER.md)                                                              |
+| `tool_output`          | Tool-result size handling; [schema](../packages/harness/vassilflow/config/tool_output_config.py)                         |
+| `tool_search`          | Deferred tool discovery; [schema](../packages/harness/vassilflow/config/tool_search_config.py)                           |
+| `title`                | Enabled; local title fallback unless `model_name` is explicitly set; [guide](AUTO_TITLE_GENERATION.md)                   |
+| `summarization`        | Disabled; context compaction thresholds and retained messages; [guide](summarization.md)                                 |
+| `memory`               | Enabled with injection enabled; 30-second debounce, 100 facts, confidence threshold 0.7; [guide](MEMORY_IMPROVEMENTS.md) |
+| `token_usage`          | Reporting controls; [schema](../packages/harness/vassilflow/config/token_usage_config.py)                                |
+| `token_budget`         | Disabled; when enabled, default total limit 200,000 tokens; [details below](#token-accounting-and-budgets)               |
+| `agents_api`           | Personal-agent API controls; [schema](../packages/harness/vassilflow/config/agents_api_config.py)                        |
+| `acp_agents`           | External ACP workers; [schema](../packages/harness/vassilflow/config/acp_config.py)                                      |
+| `subagents`            | Built-in overrides and custom workers; [guide](task_tool_improvements.md)                                                |
+| `guardrails`           | Disabled; provider-based tool authorization; [guide](GUARDRAILS.md)                                                      |
+| `suggestions`          | Follow-up suggestions; [schema](../packages/harness/vassilflow/config/suggestions_config.py)                             |
+| `circuit_breaker`      | Runtime failure limiting; defined in [AppConfig](../packages/harness/vassilflow/config/app_config.py)                    |
+| `loop_detection`       | Repeated tool-call detection; [schema](../packages/harness/vassilflow/config/loop_detection_config.py)                   |
+| `read_before_write`    | File editing checks; [schema](../packages/harness/vassilflow/config/read_before_write_config.py)                         |
+| `tool_progress`        | Tool progress events; [schema](../packages/harness/vassilflow/config/tool_progress_config.py)                            |
+| `safety_finish_reason` | Provider safety-stop handling; [schema](../packages/harness/vassilflow/config/safety_finish_reason_config.py)            |
+| `auth`                 | OIDC configuration, disabled by default; local session authentication is configured separately; [SSO](SSO.md)            |
+| `database`             | Unified SQL/checkpointer backend; file-loading default is SQLite                                                         |
+| `checkpointer`         | Optional legacy checkpointer configuration; prefer the unified database section                                          |
+| `run_events`           | `memory`, `db`, or `jsonl`; default `memory`                                                                             |
+| `stream_bridge`        | Optional; defaults to in-process memory, queue size 256. Redis is declared in the schema but is not implemented          |
+| `channels`             | Deployment-level IM bot configuration; [guide](IM_CHANNEL_CONNECTIONS.md)                                                |
+| `channel_connections`  | User-owned channel binding controls; [guide](IM_CHANNEL_CONNECTIONS.md)                                                  |
+| `uploads`              | Gateway upload limits and optional document conversion; [guide](FILE_UPLOAD.md)                                          |
 
-USER root
-# Example user dependency; not required by VassilFlow itself.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends graphviz \
-    && rm -rf /var/lib/apt/lists/*
-
-# Example Python dependency for work done inside the sandbox.
-RUN python -m pip install --no-cache-dir pandas
-
-# Do not override ENTRYPOINT or CMD; keep the published sandbox server startup.
-```
-
-Use the custom image in local Docker or Apple Container mode with `sandbox.image`:
-
-```yaml
-sandbox:
-  use: vassilflow.community.aio_sandbox:AioSandboxProvider
-  image: your-registry/your-aio-sandbox:tag
-```
-
-In provisioner mode, sandbox Pods are created by the provisioner service, so configure the provisioner `SANDBOX_IMAGE` environment variable instead of `sandbox.image`. See the [Provisioner Setup Guide](../../docker/provisioner/README.md#custom-sandbox-image).
-
-If you rebuild the runtime from scratch instead of extending the published image, it must expose the same HTTP API used by `agent-sandbox`. VassilFlow currently depends on:
-
-- `sandbox.get_context()`, including `home_dir`
-- `shell.exec_command(...)`
-- `file.read_file(...)`
-- `file.write_file(...)`, including base64 writes for binary content
-- streamed `file.download_file(...)`
-- `file.find_files(...)`
-- `file.list_path(...)`
-- `file.search_in_file(...)`
-
-Custom images must also keep these compatibility constraints:
-
-- The container should listen on the configured sandbox port, `8080` by default.
-- `/mnt/user-data` must remain writable because VassilFlow mounts thread workspace, uploads, and outputs there.
-- `home_dir` comes from the sandbox context endpoint; do not assume VassilFlow hardcodes it.
-- Shell command handling must remain compatible with serialized `exec_command` calls. VassilFlow serializes shell access on the host side to avoid corrupting the sandbox's persistent shell session.
-
-### Skills
-
-Configure the skills directory for specialized workflows:
+## Token accounting and budgets
 
 ```yaml
-skills:
-  # Host path (optional, default: ../skills)
-  path: /custom/path/to/skills
-
-  # Container mount path (default: /mnt/skills)
-  container_path: /mnt/skills
-```
-
-**How Skills Work**:
-- Skills are stored in `VassilFlow/skills/{public,custom}/`
-- Each skill has a `SKILL.md` file with metadata
-- Skills are automatically discovered and loaded
-- Available in both local and Docker sandbox via path mapping
-
-**Per-Agent Skill Filtering**:
-Custom agents can restrict which skills they load by defining a `skills` field in their `config.yaml` (located at `workspace/agents/<agent_name>/config.yaml`):
-- **Omitted or `null`**: Loads all globally enabled skills (default fallback).
-- **`[]` (empty list)**: Disables all skills for this specific agent.
-- **`["skill-name"]`**: Loads only the explicitly specified skills.
-
-### Title Generation
-
-Automatic conversation title generation:
-
-```yaml
-title:
+token_budget:
   enabled: true
-  max_words: 6
-  max_chars: 60
-  # null uses a local fallback; set a configured model name for LLM titles.
-  model_name: null
+  max_tokens: 200000
+  max_input_tokens: null
+  max_output_tokens: null
+  warn_threshold: 0.8
+  hard_stop_threshold: 1.0
 ```
 
-### GitHub API Token (Optional for GitHub Deep Research Skill)
+Limits use usage metadata returned by providers. They are checked after responses, so an individual response or concurrent child activity can overshoot a limit. They are not a prepaid or globally reserved token pool.
 
-The default GitHub API rate limits are quite restrictive. For frequent project research, we recommend configuring a personal access token (PAT) with read-only permissions.
+The lead graph aggregates reported child usage before its budget hook decides whether to allow further tools. Each subagent graph receives its own budget middleware when globally enabled. Accounting remains enabled for enforcement when `token_usage.enabled` is false; reporting and attribution controlled by that flag remain disabled. The middleware order matters; see [execution flow](middleware-execution-flow.md).
 
-**Configuration Steps**:
-1. Uncomment the `GITHUB_TOKEN` line in the `.env` file and add your personal access token
-2. Restart the VassilFlow service to apply changes
+## Sandbox choices
 
-## Environment Variables
+- `vassilflow.sandbox.local:LocalSandboxProvider`: host filesystem tools; shell execution is disabled unless explicitly enabled. This is not container isolation.
+- `vassilflow.community.aio_sandbox:AioSandboxProvider`: container-backed AIO implementation, with local Docker/Apple runtime and provisioner modes. See [provider source](../packages/harness/vassilflow/community/aio_sandbox/aio_sandbox_provider.py).
 
-VassilFlow supports environment variable substitution using the `$` prefix:
+Set `VASSILFLOW_SANDBOX_BIND_HOST` explicitly when the Gateway-to-sandbox network layout requires a reachable address. Local container ports default to loopback; Docker-outside-of-Docker uses a different host-routing path. Binding `0.0.0.0` exposes the port on all host interfaces and requires appropriate network restrictions.
 
-```yaml
-models:
-  - api_key: $OPENAI_API_KEY  # Reads from environment
-```
+Keep project root, runtime home, host mount source, and SQLite directory distinct. [Path examples](PATH_EXAMPLES.md) documents them precisely.
 
-Runtime variables use the `VASSILFLOW_*` names below.
+## Environment variables
 
-**Common Environment Variables**:
-- `OPENAI_API_KEY` - OpenAI API key
-- `ANTHROPIC_API_KEY` - Anthropic API key
-- `DEEPSEEK_API_KEY` - DeepSeek API key
-- `MIMO_API_KEY` - Xiaomi MiMo API key
-- `NOVITA_API_KEY` - Novita API key (OpenAI-compatible endpoint)
-- `TAVILY_API_KEY` - Tavily search API key
-- `BRAVE_SEARCH_API_KEY` - Brave Search API key
-- `SERPER_API_KEY` - Serper (Google Search/Images API) key for `web_search` and `image_search`
-- `GROUNDROUTE_API_KEY` - GroundRoute meta-search API key for `web_search` and `web_fetch` (routes across Serper, Brave, Exa, Tavily, Firecrawl, Perplexity with gain-share pricing)
-- `VASSILFLOW_PROJECT_ROOT` - Project root for relative runtime paths
-- `VASSILFLOW_CONFIG_PATH` - Custom config file path
-- `VASSILFLOW_EXTENSIONS_CONFIG_PATH` - Custom extensions config file path
-- `VASSILFLOW_HOME` - Runtime state directory (defaults to `.vassilflow` under the project root)
-- `VASSILFLOW_SKILLS_PATH` - Skills directory when `skills.path` is omitted
-- `GATEWAY_ENABLE_DOCS` - Set to `false` to disable Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI schema (`/openapi.json`) endpoints (default: `true`)
+Runtime variables use the `VASSILFLOW_*` names below. These names do not replace the separate authentication, Gateway, and provider variables.
 
-## Configuration Location
+- `VASSILFLOW_PROJECT_ROOT` - Caller project root for project-relative resources.
+- `VASSILFLOW_HOME` - Runtime state directory.
+- `VASSILFLOW_CONFIG_PATH` - Configuration file path.
+- `VASSILFLOW_EXTENSIONS_CONFIG_PATH` - Extension configuration file path.
+- `VASSILFLOW_SKILLS_PATH` - Skills directory override.
+- `VASSILFLOW_HOST_BASE_DIR` - Host-visible counterpart of runtime home for container bind mounts.
+- `VASSILFLOW_SANDBOX_BIND_HOST` - Sandbox port binding override.
+- `VASSILFLOW_AUTH_DISABLED` - Explicit local authentication bypass; see [authentication](AUTH_DESIGN.md).
+- `VASSILFLOW_INTERNAL_AUTH_TOKEN` - Shared internal Gateway token override; otherwise process-generated.
+- `AUTH_JWT_SECRET` - Session signing secret; otherwise persisted in runtime home's `.jwt_secret`.
+- `AUTH_TRUSTED_PROXIES` - Trusted proxy addresses/networks for login client-IP handling.
+- `GATEWAY_CORS_ORIGINS` - Allowed browser origins for a split frontend/Gateway deployment.
+- `GATEWAY_WORKERS`, `WEB_CONCURRENCY` - Must each be `1` if supplied.
 
-The configuration file should be placed in the **project root directory** (`VassilFlow/config.yaml`). Set `VASSILFLOW_PROJECT_ROOT` when the process may start from another working directory, or set `VASSILFLOW_CONFIG_PATH` to point at a specific file.
+## Reload and restart
 
-## Configuration Priority
+Request-scoped configuration can be reloaded for subsequent runs; it does not rebuild startup resources. Restart Gateway after changing `database`, `checkpointer`, `run_events`, `stream_bridge`, `sandbox`, `log_level`, `channels`, or `channel_connections`. The authoritative registry is [reload_boundary.py](../packages/harness/vassilflow/config/reload_boundary.py). Environment changes also require restarting the process that consumes them.
 
-VassilFlow searches for configuration in this order:
+## PostgreSQL and upgrades
 
-1. Path specified in code via `config_path` argument
-2. Path from `VASSILFLOW_CONFIG_PATH`
-3. `config.yaml` under `VASSILFLOW_PROJECT_ROOT` or the current working directory
-4. Backend/repository-root locations for monorepo compatibility
+PostgreSQL shares a database URL between application persistence and the checkpointer, with separate connection pools. From `backend/`, run `uv sync --extra postgres`; the [backend extra](../pyproject.toml) includes the [harness PostgreSQL extra](../packages/harness/pyproject.toml). Then set `database.backend: postgres` and `database.postgres_url: $DATABASE_URL`. PostgreSQL does not enable multiple Gateway workers.
 
-## Security Notes
-### Sandbox Isolation and the Docker Socket (DooD)
-
-VassilFlow executes agent-generated shell/code through a configurable sandbox
-(`sandbox.use` in `config.yaml`). The isolation guarantees differ by mode, and
-one mode requires mounting the host Docker socket. Understand the trade-offs
-before exposing an instance to untrusted input.
-
-| Mode | `config.yaml` | Host Docker socket | Isolation |
-|------|---------------|--------------------|-----------|
-| `local` (default) | `vassilflow.sandbox.local:LocalSandboxProvider` | Not mounted | Commands run **inside the gateway container** on its filesystem. Not a strong boundary — `allow_host_bash` is `false` by default and should stay off for untrusted workloads. |
-| `aio` (pure DooD) | `vassilflow.community.aio_sandbox:AioSandboxProvider` (no `provisioner_url`) | **Mounted** (opt-in overlay) | Sandbox containers are started via the host Docker daemon. |
-| `provisioner` (Kubernetes) | `AioSandboxProvider` + `provisioner_url` | Not mounted | Sandbox pods are created through the provisioner's K8s API over HTTP. Strongest isolation. |
-
-#### The Docker socket is host root
-
-Mounting `/var/run/docker.sock` into a container grants that container
-**root-equivalent control of the host**: anything able to reach the socket can
-start a new container that bind-mounts the host filesystem and escape. This
-matters for VassilFlow because the gateway executes model-generated commands, so a
-prompt injection or any in-container code-execution primitive could pivot to the
-host through the socket.
-
-To keep this off the default attack surface:
-
-- The host Docker socket is **not** mounted by the default Compose stack. It is
-  added only for `aio` mode through the opt-in `docker/docker-compose.dood.yaml`
-  overlay, which `scripts/deploy.sh` and `scripts/docker.sh` append
-  automatically when `detect_sandbox_mode()` returns `aio`.
-- Prefer **provisioner/Kubernetes mode** for multi-tenant or internet-exposed
-  deployments — it isolates sandboxes without handing the gateway the host
-  daemon.
-- If you must use `aio`/DooD, treat the host as part of the gateway's trust
-  boundary: run it on a dedicated host, and consider a scoped Docker API proxy
-  instead of the raw socket.
-
-> Note: the gateway bind-mounts `$HOME/.claude` and `$HOME/.codex` (read-only)
-> for CLI auto-auth in **all** modes. These hold long-lived CLI credentials;
-> scope or omit them when the gateway runs untrusted workloads.
-
-### CLI Credential Mounts (Claude Code / Codex)
-
-VassilFlow can reuse your Claude Code / Codex CLI subscription login as a model
-provider (`ClaudeChatModel`, the Codex provider) or for ACP agents that run the
-CLI in-container. The Compose stack used to bind-mount the **entire** `~/.claude`
-and `~/.codex` directories (read-only) into the gateway container in **every**
-configuration — exposing not just credentials but full conversation history,
-per-project session data, and global CLI config. A gateway compromise (prompt
-injection, tool/MCP misuse, RCE) would leak all of it.
-
-These directories are **no longer mounted by default**. Supply CLI credentials
-with the least exposure that fits your setup:
-
-| Need | How | Exposure |
-|------|-----|----------|
-| Claude model provider | env `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN` (via `.env`), or `CLAUDE_CODE_CREDENTIALS_PATH` → a single mounted `.credentials.json` | none / one file |
-| Codex model provider | env `CODEX_AUTH_PATH` pointing at a single mounted `auth.json` | one file |
-| ACP agent | the adapter's own auth — many ACP adapters take an env API key (e.g. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) and need no mount; use the opt-in `docker/docker-compose.cli-auth.yaml` overlay only if your adapter reads the full CLI config dir | none / full dir |
-
-The Gateway credential loader checks environment variables **before** the
-default credential files, so the env-token paths need no bind mount at all. ACP
-adapters authenticate independently of VassilFlow via their own documented env —
-for example the common `claude-code-acp` adapter starts as
-`ANTHROPIC_API_KEY=… claude-code-acp` and honors `CLAUDE_CONFIG_DIR` to redirect
-its config directory, so it needs no `~/.claude` mount at all. Prefer the
-adapter's documented env auth, and reach for the
-`docker-compose.cli-auth.yaml` overlay only as a fallback for an adapter that
-genuinely reads the full CLI config directory.
-
-
-## Best Practices
-
-1. **Place `config.yaml` in project root** - Set `VASSILFLOW_PROJECT_ROOT` if the runtime starts elsewhere
-2. **Never commit `config.yaml`** - It's already in `.gitignore`
-3. **Use environment variables for secrets** - Don't hardcode API keys
-4. **Keep `config.example.yaml` updated** - Document all new options
-5. **Test configuration changes locally** - Before deploying
-6. **Use Docker sandbox for production** - Better isolation and security
-
-## Troubleshooting
-
-### "Config file not found"
-- Ensure `config.yaml` exists in the **project root** directory (`VassilFlow/config.yaml`)
-- If the runtime starts outside the project root, set `VASSILFLOW_PROJECT_ROOT`
-- Alternatively, set `VASSILFLOW_CONFIG_PATH` environment variable to custom location
-
-### "Invalid API key"
-- Verify environment variables are set correctly
-- Check that `$` prefix is used for env var references
-
-### "Skills not loading"
-- Check that `VassilFlow/skills/` directory exists
-- Verify skills have valid `SKILL.md` files
-- Check `skills.path` or `VASSILFLOW_SKILLS_PATH` if using a custom path
-
-### "Docker sandbox fails to start"
-- Ensure Docker is running
-- Check port 8080 (or configured port) is available
-- Verify Docker image is accessible
-
-## Examples
-
-See `config.example.yaml` for complete examples of all configuration options.
+Version 21 removes legacy built-in Office tool registrations. Generic uploads and document conversion remain available. Back up persistent SQL and runtime files before an upgrade; use the registered migration/repair tools described in [architecture](ARCHITECTURE.md), and inspect their plans before applying changes.

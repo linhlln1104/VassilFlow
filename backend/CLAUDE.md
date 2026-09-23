@@ -760,6 +760,16 @@ For models with `supports_vision: true`:
 
 ## Documentation
 
+Use [docs/README.md](docs/README.md) as the complete backend documentation index.
+Guides under `backend/docs/` use English and repository-root-relative source
+paths, with relative Markdown links to existing files. State the working
+directory for commands and distinguish schema defaults from launcher overrides.
+Keep API examples aligned with Gateway OpenAPI and implemented behavior; a
+compatibility field in a request model does not establish feature support.
+The retained RFC and test-plan filenames describe current contracts or validation
+procedures, not historical release pass claims. When changing documentation,
+check links and example syntax and run `tests/test_vassilflow_docs.py`.
+
 See `docs/` directory for detailed documentation:
 - [CONFIGURATION.md](docs/CONFIGURATION.md) - Configuration options
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) - Architecture details

@@ -1,176 +1,61 @@
-# Task Tool Improvements
+# Delegated tasks and subagents
 
-## Overview
+Status: implemented behavior. The historical filename is retained. The `task` tool delegates work and returns its result after completion; the model does not need to poll a separate task-status tool.
 
-The task tool has been improved to eliminate wasteful LLM polling. Previously, when using background tasks, the LLM had to repeatedly call `task_status` to poll for completion, causing unnecessary API requests.
+## Available workers
 
-## Changes Made
+The shipped types are `general-purpose` and `bash`. The bash specialist is available only when the configured sandbox permits shell access. The local sandbox disables host bash by default. Additional worker types can be declared under `subagents.custom_agents`.
 
-### 1. Removed `run_in_background` Parameter
+Delegated workers are not the same as user-owned personal agents or built-in product agents. The base product-agent registry is empty; delegation remains available independently.
 
-The `run_in_background` parameter has been removed from the `task` tool. All subagent tasks now run asynchronously by default, but the tool handles completion automatically.
+Enable delegation through `subagent_enabled` in Gateway runtime context or `VassilFlowClient(subagent_enabled=True)`. The direct factory has a `RuntimeFeatures.subagent` option. Agent policy can further restrict delegation and tool availability.
 
-**Before:**
-```python
-# LLM had to manage polling
-task_id = task(
-    subagent_type="bash",
-    prompt="Run tests",
-    description="Run tests",
-    run_in_background=True
-)
-# Then LLM had to poll repeatedly:
-while True:
-    status = task_status(task_id)
-    if completed:
-        break
+## Tool input and lifecycle
+
+The model supplies `description`, `prompt`, and `subagent_type`. Runtime identity and execution context are injected by the graph. Example arguments:
+
+```json
+{
+  "description": "Review uploaded source",
+  "prompt": "Inspect the files under /mnt/user-data/uploads and summarize their structure without modifying them.",
+  "subagent_type": "general-purpose"
+}
 ```
 
-**After:**
-```python
-# Tool blocks until complete, polling happens in backend
-result = task(
-    subagent_type="bash",
-    prompt="Run tests",
-    description="Run tests"
-)
-# Result is available immediately after the call returns
+The [task tool](../packages/harness/vassilflow/tools/builtins/task_tool.py) starts background execution, checks status in the backend at five-second intervals, emits progress events, and waits before returning the result to the parent. It does not make additional model calls merely to poll status. The tool itself can remain active for the full child runtime.
+
+Events include task start, incremental messages, completion, failure, cancellation, and timeout. The execution timeout and polling safety buffer are different limits. A failed or max-turn-limited child can return partial information; inspect its outcome rather than treating all returned text as success.
+
+## Configuration
+
+```yaml
+subagents:
+  timeout_seconds: 1800
+  max_turns: null
+  agents:
+    general-purpose:
+      timeout_seconds: 900
+      max_turns: 40
+      skills: []
+  custom_agents:
+    reviewer:
+      description: Review text files without editing them
+      system_prompt: Read the provided source and report specific findings.
+      tools: [read_file, ls, glob, grep]
+      skills: []
+      model: inherit
+      max_turns: 30
+      timeout_seconds: 900
 ```
 
-### 2. Backend Polling
+Built-in workers use the global 1800-second default unless overridden. A custom worker has its own default timeout of 900 seconds and max turns of 50. Per-agent overrides take precedence where supported. A null skill list inherits enabled skills; an empty list provides none. Tool inheritance remains constrained by parent policy.
 
-The `task_tool` now:
-- Starts the subagent task asynchronously
-- Polls for completion in the backend (every 2 seconds)
-- Blocks the tool call until completion
-- Returns the final result directly
+Concurrent-child limits are runtime settings applied by [SubagentLimitMiddleware](../packages/harness/vassilflow/agents/middlewares/subagent_limit_middleware.py), separate from the timeout section above. Avoid documenting one global hard-coded concurrency or timeout for every entry point.
 
-This means:
-- ✅ LLM makes only ONE tool call
-- ✅ No wasteful LLM polling requests
-- ✅ Backend handles all status checking
-- ✅ Timeout protection (5 minutes max)
+## Guards and limits
 
-### 3. Removed `task_status` from LLM Tools
+Delegated graphs use the shared runtime guardrails and enabled loop/budget/safety guards. When application token budgets are enabled, each child gets its own budget instance. The lead separately aggregates reported child usage before allowing subsequent tools. This does not reserve a shared remaining token pool and cannot prevent every overshoot from concurrent responses.
 
-The `task_status_tool` is no longer exposed to the LLM. It's kept in the codebase for potential internal/debugging use, but the LLM cannot call it.
+The executor and active tasks are process-local; they are not durable distributed jobs. Parent cancellation and shutdown require cleanup of owned tasks. New tools should not bypass that ownership by starting untracked background work.
 
-### 4. Updated Documentation
-
-- Updated `SUBAGENT_SECTION` in `prompt.py` to remove all references to background tasks and polling
-- Simplified usage examples
-- Made it clear that the tool automatically waits for completion
-
-## Implementation Details
-
-### Polling Logic
-
-Public import: `vassilflow.tools.builtins.task_tool`
-
-Current implementation file: `packages/harness/vassilflow/tools/builtins/task_tool.py`
-
-```python
-# Start background execution
-task_id = executor.execute_async(prompt)
-
-# Poll for task completion in backend
-while True:
-    result = get_background_task_result(task_id)
-
-    # Check if task completed or failed
-    if result.status == SubagentStatus.COMPLETED:
-        return f"[Subagent: {subagent_type}]\n\n{result.result}"
-    elif result.status == SubagentStatus.FAILED:
-        return f"[Subagent: {subagent_type}] Task failed: {result.error}"
-
-    # Wait before next poll
-    time.sleep(2)
-
-    # Timeout protection (5 minutes)
-    if poll_count > 150:
-        return "Task timed out after 5 minutes"
-```
-
-### Execution Timeout
-
-In addition to polling timeout, subagent execution now has a built-in timeout mechanism:
-
-**Configuration import**: `vassilflow.subagents.config`
-```python
-@dataclass
-class SubagentConfig:
-    # ...
-    timeout_seconds: int = 300  # 5 minutes default
-```
-
-**Thread Pool Architecture**:
-
-To avoid nested thread pools and resource waste, we use two dedicated thread pools:
-
-1. **Scheduler Pool** (`_scheduler_pool`):
-   - Max workers: 4
-   - Purpose: Orchestrates background task execution
-   - Runs `run_task()` function that manages task lifecycle
-
-2. **Execution Pool** (`_execution_pool`):
-   - Max workers: 8 (larger to avoid blocking)
-   - Purpose: Actual subagent execution with timeout support
-   - Runs `execute()` method that invokes the agent
-
-**How it works**:
-```python
-# In execute_async():
-_scheduler_pool.submit(run_task)  # Submit orchestration task
-
-# In run_task():
-future = _execution_pool.submit(self.execute, task)  # Submit execution
-exec_result = future.result(timeout=timeout_seconds)  # Wait with timeout
-```
-
-**Benefits**:
-- ✅ Clean separation of concerns (scheduling vs execution)
-- ✅ No nested thread pools
-- ✅ Timeout enforcement at the right level
-- ✅ Better resource utilization
-
-**Two-Level Timeout Protection**:
-1. **Execution Timeout**: Subagent execution itself has a 5-minute timeout (configurable in SubagentConfig)
-2. **Polling Timeout**: Tool polling has a 5-minute timeout (30 polls × 10 seconds)
-
-This ensures that even if subagent execution hangs, the system won't wait indefinitely.
-
-### Benefits
-
-1. **Reduced API Costs**: No more repeated LLM requests for polling
-2. **Simpler UX**: LLM doesn't need to manage polling logic
-3. **Better Reliability**: Backend handles all status checking consistently
-4. **Timeout Protection**: Two-level timeout prevents infinite waiting (execution + polling)
-
-## Testing
-
-To verify the changes work correctly:
-
-1. Start a subagent task that takes a few seconds
-2. Verify the tool call blocks until completion
-3. Verify the result is returned directly
-4. Verify no `task_status` calls are made
-
-Example test scenario:
-```python
-# This should block for ~10 seconds then return result
-result = task(
-    subagent_type="bash",
-    prompt="sleep 10 && echo 'Done'",
-    description="Test task"
-)
-# result should contain "Done"
-```
-
-## Upgrade Notes
-
-For users/code that previously used `run_in_background=True`:
-- Simply remove the parameter
-- Remove any polling logic
-- The tool will automatically wait for completion
-
-No other changes needed - the API is backward compatible (minus the removed parameter).
+See [subagents source](../packages/harness/vassilflow/subagents/), [middleware ordering](middleware-execution-flow.md), and [streaming](STREAMING.md).

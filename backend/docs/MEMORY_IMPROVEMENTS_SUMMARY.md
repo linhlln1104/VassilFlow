@@ -1,38 +1,21 @@
-# Memory System Improvements - Summary
+# Memory behavior summary
 
-## Sync Note (2026-03-10)
+Status: implemented behavior and current limits. The canonical guide is [Persistent memory](MEMORY_IMPROVEMENTS.md).
 
-This summary is synchronized with the `main` branch implementation.
-TF-IDF/context-aware retrieval is **planned**, not merged yet.
+| Concern          | Current behavior                                                                          |
+| ---------------- | ----------------------------------------------------------------------------------------- |
+| Persistence      | File-based provider by default; custom `MemoryStorage` implementations supported          |
+| Scope            | Effective user and optional personal agent                                                |
+| Extraction       | Model-assisted updates, debounced and queued                                              |
+| Scheduling       | Completion-driven pending work; stale timer generations are ignored                       |
+| Injection        | Context/history sections and confidence-ranked facts under configurable budgets           |
+| Corrections      | Configurable guaranteed categories; corrections protected by default                      |
+| Staleness        | Model-assisted review constrained by age, count, removal, and protected-category settings |
+| Uploads          | Ephemeral uploaded-file context filtered from extraction input                            |
+| Management       | Authenticated fact CRUD, import/export, reload, clear, config, and status APIs            |
+| Durability limit | Pending extraction jobs are in memory and can be lost on process exit                     |
+| Retrieval limit  | No semantic/vector retrieval in the injection formatter                                   |
 
-## Implemented
+Memory is not the conversation transcript. Use checkpoints and run-event/message storage for conversation history. Automatic summarization can notify the memory extraction hook before messages are compacted, but it does not turn the queue into a synchronous durable transaction.
 
-- Accurate token counting with `tiktoken` in memory injection.
-- Facts are injected into `<memory>` prompt content.
-- Facts are ordered by confidence and bounded by `max_injection_tokens`.
-
-## Planned (Not Yet Merged)
-
-- TF-IDF cosine similarity recall based on recent conversation context.
-- `current_context` parameter for `format_memory_for_injection`.
-- Weighted ranking (`similarity` + `confidence`).
-- Runtime extraction/injection flow for context-aware fact selection.
-
-## Why This Sync Was Needed
-
-Earlier docs described TF-IDF behavior as already implemented, which did not match code in `main`.
-This mismatch is tracked in issue `#1059`.
-
-## Current API Shape
-
-```python
-def format_memory_for_injection(memory_data: dict[str, Any], max_tokens: int = 2000) -> str:
-```
-
-No `current_context` argument is currently available in `main`.
-
-## Verification Pointers
-
-- Implementation: `packages/harness/vassilflow/agents/memory/prompt.py`
-- Prompt assembly: `packages/harness/vassilflow/agents/lead_agent/prompt.py`
-- Regression tests: `backend/tests/test_memory_prompt_injection.py`
+For exact configuration and caveats, see [MemoryConfig](../packages/harness/vassilflow/config/memory_config.py), [storage](../packages/harness/vassilflow/agents/memory/storage.py), and [prompt formatting](../packages/harness/vassilflow/agents/memory/prompt.py).

@@ -1,77 +1,36 @@
-# Docker Test Gap (Section 七 7.4)
+# Container authentication validation
 
-This file documents the only **un-executed** test cases from
-`backend/docs/AUTH_TEST_PLAN.md` after the full release validation pass.
+This filename is retained for existing links. It now contains the current container validation checklist rather than a historical claim about one release machine or an untested Docker gap.
 
-## Why this gap exists
+## Topology and prerequisites
 
-The release validation environment (sg_dev: `10.251.229.92`) **does not have
-a Docker daemon installed**. The TC-DOCKER cases are container-runtime
-behavior tests that need an actual Docker engine to spin up
-`docker/docker-compose.yaml` services.
+The [Compose file](../../docker/docker-compose.yaml) runs Gateway with its embedded runtime, the frontend, and nginx, with additional services selected by configuration. There is no separate LangGraph application server or Office renderer.
 
-```bash
-$ ssh sg_dev "which docker; docker --version"
-# (empty)
-# bash: docker: command not found
-```
+Use a disposable deployment with a working Docker daemon and Docker Compose. Inspect resolved mounts and environment configuration locally before starting it. Do not publish a resolved Compose configuration containing secrets.
 
-All other test plan sections were executed against either:
-- The local dev box (Mac, all services running locally), or
-- The deployed sg_dev instance (gateway + frontend + nginx via SSH tunnel)
+Gateway must run with one worker. `GATEWAY_WORKERS=1` is the supported value; increasing it is a rejected configuration, including with PostgreSQL.
 
-## Cases not executed
+## Checks
 
-| Case | Title | What it covers | Why not run |
-|---|---|---|---|
-| TC-DOCKER-01 | `vassilflow.db` volume persistence | Verify the `VASSILFLOW_HOME` bind mount survives container restart | needs `docker compose up` |
-| TC-DOCKER-02 | Session persistence across container restart | `AUTH_JWT_SECRET` env var keeps cookies valid after `docker compose down && up` | needs `docker compose down/up` |
-| TC-DOCKER-03 | Per-worker rate limiter divergence | Confirms in-process `_login_attempts` dict doesn't share state across `gunicorn` workers (4 by default in the compose file); known limitation, documented | needs multi-worker container |
-| TC-DOCKER-04 | IM channels use internal Gateway auth | Verify Feishu/Slack/Telegram dispatchers attach the process-local internal auth header plus CSRF cookie/header when calling Gateway-compatible LangGraph APIs | needs `docker logs` |
-| TC-DOCKER-05 | Reset credentials surfacing | `reset_admin` writes a 0600 credential file in `VASSILFLOW_HOME` instead of logging plaintext. The file-based behavior is validated by non-Docker reset tests, so the only Docker-specific gap is verifying the volume mount carries the file out to the host | needs container + host volume |
-| TC-DOCKER-06 | Docker deploy uses Gateway embedded runtime | `./scripts/deploy.sh` produces a Gateway + frontend + nginx topology (no `langgraph` container); same auth flow as local `make dev` | needs `docker compose up` |
+| Case             | Procedure                                                                      | Evidence                                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Persistent state | Initialize an account, create a thread, and upload a file; restart Gateway     | Account, thread, checkpoint/event history selected for persistence, and artifact remain accessible           |
+| Session secret   | Keep the database and `AUTH_JWT_SECRET` or mounted `.jwt_secret`; restart      | Existing unexpired cookie remains valid                                                                      |
+| Secret rotation  | Rotate only the signing secret in the disposable deployment                    | Old session is rejected; fresh login succeeds                                                                |
+| Owner separation | Create resources as account A; request them as B                               | No cross-owner reads or mutations                                                                            |
+| Proxy headers    | Test through external HTTPS and inspect cookie flags                           | Secure/HttpOnly/SameSite behavior matches [auth design](AUTH_DESIGN.md)                                      |
+| CSRF             | Submit a protected mutation without and with the matching cookie/header        | Invalid pair rejected; valid authorized pair succeeds                                                        |
+| Worker guard     | Start the disposable Gateway with worker count above one                       | Startup rejects the unsupported configuration                                                                |
+| IM dispatch      | Connect a configured bot and send a message                                    | Internal authentication works; run owner matches the binding                                                 |
+| Reset file       | Run the reset CLI inside Gateway with the deployment environment               | Credential file appears in mounted runtime home with restricted access; plaintext is absent from normal logs |
+| Readiness        | Request `/health/ready` with dependencies healthy and deliberately unavailable | Readiness distinguishes usable runtime from unavailable dependencies                                         |
 
-## Coverage already provided by non-Docker tests
+Run reset commands with `docker compose exec` against the correct Compose project and Gateway service. The command is `uv run python -m app.gateway.auth.reset_admin` from `backend/`; inspect `--help` before selecting an account.
 
-The **auth-relevant** behavior in each Docker case is already exercised by
-the test cases that ran on sg_dev or local:
+## Path verification
 
-| Docker case | Auth behavior covered by |
-|---|---|
-| TC-DOCKER-01 (volume persistence) | TC-REENT-01 on sg_dev (admin row survives gateway restart) — same SQLite file, just no container layer between |
-| TC-DOCKER-02 (session persistence) | TC-API-02/03/06 (cookie roundtrip), plus TC-REENT-04 (multi-cookie) — JWT verification is process-state-free, container restart is equivalent to `pkill uvicorn && uv run uvicorn` |
-| TC-DOCKER-03 (per-worker rate limit) | TC-GW-04 + TC-REENT-09 (single-worker rate limit + 5min expiry). The cross-worker divergence is an architectural property of the in-memory dict; no auth code path differs |
-| TC-DOCKER-04 (IM channels use internal auth) | Code-level: `app/channels/manager.py` creates the `langgraph_sdk` client with `create_internal_auth_headers()` plus CSRF cookie/header, so channel workers do not rely on browser cookies |
-| TC-DOCKER-05 (credential surfacing) | `reset_admin` writes `.vassilflow/admin_initial_credentials.txt` with mode 0600 and logs only the path; an existing `.vassilflow/admin_initial_credentials.txt` is still possible when using a previous runtime home. The only Docker-unique step is whether the bind mount projects this path onto the host, which is a `docker compose` config check, not a runtime behavior change |
-| TC-DOCKER-06 (Gateway embedded runtime container) | Section 七 7.2 covered by TC-GW-01..05 + Section 二 (Gateway auth flow on sg_dev) — same Gateway code, container is just a packaging change |
+Inside the current Gateway container, runtime home is `/app/backend/.vassilflow`. The host source of the mount is configured separately. `database.sqlite_dir` is also separate from runtime home; verify that the selected database is covered by persistent storage. See [paths](PATH_EXAMPLES.md).
 
-## Reproduction steps when Docker becomes available
+A persistent runtime volume can retain `.jwt_secret` without an explicit `AUTH_JWT_SECRET`; an environment secret is not mandatory for restart continuity. Losing both the environment secret and fallback secret invalidates existing sessions.
 
-Anyone with `docker` + `docker compose` installed can reproduce the gap by
-running the test plan section verbatim. Pre-flight:
-
-```bash
-# Required on the host
-docker --version           # >=24.x
-docker compose version     # plugin >=2.x
-
-# Required env var (otherwise sessions reset on every container restart)
-echo "AUTH_JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" \
-  >> .env
-
-# Optional: pin VASSILFLOW_HOME to a stable host path
-echo "VASSILFLOW_HOME=$HOME/vassilflow-data" >> .env
-```
-
-Then run TC-DOCKER-01..06 from the test plan as written.
-
-## Decision log
-
-- **Not blocking the release.** The auth-relevant behavior in every Docker
-  case has an already-validated equivalent on bare metal. The gap is purely
-  about *container packaging* details (bind mounts, multi-worker, log
-  collection), not about whether the auth code paths work.
-- **TC-DOCKER-05 was updated in place** in `AUTH_TEST_PLAN.md` to reflect
-  the current reset flow (`reset_admin` → 0600 credentials file, no log leak).
-  The old "grep 'Password:' in docker logs" expectation would have failed
-  silently and given a false sense of coverage.
+Record actual image/commit identifiers, mount layout, worker count, configuration choices, and results. Unit tests cover application behavior but cannot establish that a deployment's mounts, network routes, or proxy headers are correct.

@@ -1,755 +1,198 @@
-# API Reference
+# Gateway API reference
 
-This document provides a complete reference for the VassilFlow backend APIs.
+This is the reference for the VassilFlow backend APIs implemented by [app/gateway](../app/gateway/). Gateway embeds the agent runtime; its LangGraph-compatible endpoints are a supported subset, not a complete LangGraph Platform implementation.
 
-## Overview
+## Addresses and schema
 
-VassilFlow backend exposes two sets of APIs:
+| Access path                         | Address                                        |
+| ----------------------------------- | ---------------------------------------------- |
+| Full application through nginx      | `http://localhost:2026`                        |
+| Direct Gateway in local development | `http://localhost:8001`                        |
+| Native API prefix                   | `/api`                                         |
+| nginx compatibility prefix          | `/api/langgraph` (rewritten to Gateway `/api`) |
+| Interactive OpenAPI documentation   | Gateway `/docs`                                |
+| Machine-readable schema             | Gateway `/openapi.json`                        |
 
-1. **LangGraph-compatible API** - Agent interactions, threads, and streaming (`/api/langgraph/*`)
-2. **Gateway API** - Models, MCP, skills, uploads, artifacts, and console metrics (`/api/*`)
+The route inventory below was checked against `app.openapi()` on 2026-09-23. Use the running Gateway's schema for all request fields, response models, query parameters, and validation constraints. Proxy routing is defined in [docker/nginx](../../docker/nginx/).
 
-All APIs are accessed through the Nginx reverse proxy at port 2026.
+## Authentication and ownership
 
-## LangGraph-compatible API
+Most API routes require the `access_token` HttpOnly session cookie. Local login uses form fields `username` (email) and `password`. Registration and first-administrator initialization use JSON. The JWT is not returned in the login response body.
 
-Base URL: `/api/langgraph`
+Mutating authenticated requests normally also need a `csrf_token` cookie and a matching `X-CSRF-Token` header. Browser clients must send credentials to Gateway. Login, logout, registration, and initialization use the bootstrap origin checks instead of the normal double-submit requirement. See [authentication design](AUTH_DESIGN.md) for exceptions and internal channel authentication.
 
-The public LangGraph-compatible API follows LangGraph SDK conventions. In the unified nginx deployment, Gateway owns `/api/langgraph/*` and translates those paths to its native `/api/*` run, thread, and streaming routers.
+Thread, run, artifact, memory, and personal-agent access use the effective owner from authentication. A supplied user ID or metadata field does not grant ownership. Administrator-only configuration routes additionally check role. Consult the route's permission decorator, not just whether OpenAPI displays a security scheme.
 
-### Threads
+## Create a thread and run
 
-#### Create Thread
-
-```http
-POST /api/langgraph/threads
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "metadata": {}
-}
-```
-
-**Response:**
-```json
-{
-  "thread_id": "abc123",
-  "created_at": "2024-01-15T10:30:00Z",
-  "metadata": {}
-}
-```
-
-#### Get Thread State
-
-```http
-GET /api/langgraph/threads/{thread_id}/state
-```
-
-**Response:**
-```json
-{
-  "values": {
-    "messages": [...],
-    "sandbox": {...},
-    "artifacts": [...],
-    "thread_data": {...},
-    "title": "Conversation Title"
-  },
-  "next": [],
-  "config": {...}
-}
-```
-
-### Runs
-
-#### Create Run
-
-Execute the agent with input.
-
-```http
-POST /api/langgraph/threads/{thread_id}/runs
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "input": {
-    "messages": [
-      {
-        "role": "user",
-        "content": "Hello, can you help me?"
-      }
-    ]
-  },
-  "config": {
-    "recursion_limit": 100,
-    "configurable": {
-      "model_name": "gpt-4",
-      "thinking_enabled": false,
-      "is_plan_mode": false
-    }
-  },
-  "stream_mode": ["values", "messages-tuple", "custom"]
-}
-```
-
-**Stream Mode Compatibility:**
-- Use: `values`, `messages-tuple`, `custom`, `updates`, `events`, `debug`, `tasks`, `checkpoints`
-- Do not use: `tools` (deprecated/invalid in current `langgraph-api` and will trigger schema validation errors)
-
-**Recursion Limit:**
-
-`config.recursion_limit` caps the number of graph steps LangGraph will execute
-in a single run. The unified Gateway path defaults to `100` in
-`build_run_config` (see `backend/app/gateway/services.py`), which is a safer
-starting point for plan-mode or subagent-heavy runs. Clients can still set
-`recursion_limit` explicitly in the request body; increase it if you run deeply
-nested subagent graphs.
-
-**Configurable Options:**
-- `model_name` (string): Override the default model
-- `thinking_enabled` (boolean): Enable extended thinking for supported models
-- `is_plan_mode` (boolean): Enable TodoList middleware for task tracking
-
-**Capability Inputs:**
-
-The generic `capability_inputs` field is reserved for bounded, typed context
-owned by registered server-side Agent capability adapters. The base distribution
-ships no built-in product Agents or concrete capability inputs.
-
-Each item uses the `vassilflow.capability_input.v1` schema, a registered
-`capability` name, a domain-defined `kind`, and a bounded `payload`. A domain
-extension must validate its own payload and resolve canonical user-owned state;
-these fields are not an API for invoking an arbitrary unregistered capability.
-
-REST clients may send an array in the top-level `capability_inputs` field.
-SDK clients may send the same array under `context.capability_inputs`. Client
-payloads are optimistic guards, not runtime authority: the Gateway removes
-client copies and injects only values resolved by the selected Agent's
-server-owned capability adapter.
-
-**Response:** Server-Sent Events (SSE) stream
-
-```
-event: values
-data: {"messages": [...], "title": "..."}
-
-event: messages
-data: {"content": "Hello! I'd be happy to help.", "role": "assistant"}
-
-event: end
-data: {}
-```
-
-#### Get Run History
-
-```http
-GET /api/langgraph/threads/{thread_id}/runs
-```
-
-**Response:**
-```json
-{
-  "runs": [
-    {
-      "run_id": "run123",
-      "status": "success",
-      "created_at": "2024-01-15T10:30:00Z"
-    }
-  ]
-}
-```
-
-#### Stream Run
-
-Stream responses in real-time.
-
-```http
-POST /api/langgraph/threads/{thread_id}/runs/stream
-Content-Type: application/json
-```
-
-Same request body as Create Run. Returns SSE stream.
-
----
-
-## Gateway API
-
-Base URL: `/api`
-
-### Models
-
-#### List Models
-
-Get all available LLM models from configuration.
-
-```http
-GET /api/models
-```
-
-**Response:**
-```json
-{
-  "models": [
-    {
-      "name": "gpt-4",
-      "display_name": "GPT-4",
-      "supports_thinking": false,
-      "supports_vision": true
-    },
-    {
-      "name": "claude-3-opus",
-      "display_name": "Claude 3 Opus",
-      "supports_thinking": false,
-      "supports_vision": true
-    },
-    {
-      "name": "deepseek-v4",
-      "display_name": "DeepSeek V4",
-      "supports_thinking": true,
-      "supports_vision": false
-    }
-  ]
-}
-```
-
-#### Get Model Details
-
-```http
-GET /api/models/{model_name}
-```
-
-**Response:**
-```json
-{
-  "name": "gpt-4",
-  "display_name": "GPT-4",
-  "model": "gpt-4",
-  "max_tokens": 4096,
-  "supports_thinking": false,
-  "supports_vision": true
-}
-```
-
-### Console Metrics
-
-Read-only operational metrics scoped to the current user. These endpoints
-require SQL persistence (`database.backend: sqlite` or `postgres`) because
-memory mode does not keep durable run history.
-
-#### Get Console Stats
-
-```http
-GET /api/console/stats
-```
-
-Returns headline counts for runs, active runs, failed runs, threads, custom
-agents, total tokens, and optional estimated cost when model pricing metadata
-is configured.
-
-#### List Console Runs
-
-```http
-GET /api/console/runs?limit=20&offset=0&status=success
-```
-
-Returns cross-thread run history, newest first, including status, thread title,
-duration, tokens, optional cost, and error excerpts.
-
-#### Get Console Usage
-
-```http
-GET /api/console/usage?days=14&tz_offset_minutes=420
-```
-
-Returns a zero-filled daily token series and per-model breakdown. When
-`models[*].pricing.input_cache_hit_per_million` is configured, prompt-cache-hit
-input tokens are priced separately.
-
-### MCP Configuration
-
-#### Get MCP Config
-
-Get current MCP server configurations.
-
-```http
-GET /api/mcp/config
-```
-
-Requires an authenticated admin session. Sensitive env/header/OAuth secret
-values are masked in the response.
-
-**Response:**
-```json
-{
-  "mcp_servers": {
-    "github": {
-      "enabled": true,
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "***"
-      },
-      "description": "GitHub operations"
-    }
-  }
-}
-```
-
-#### Update MCP Config
-
-Update MCP server configurations.
-
-```http
-PUT /api/mcp/config
-Content-Type: application/json
-```
-
-Requires an authenticated admin session. API-managed `stdio` MCP servers may
-only use allowed executable names for `command` (default: `npx`, `uvx`). Set
-`VASSILFLOW_MCP_STDIO_COMMAND_ALLOWLIST` to a comma-separated list when a
-deployment needs additional trusted launchers.
-
-**Request Body:**
-```json
-{
-  "mcp_servers": {
-    "github": {
-      "enabled": true,
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "$GITHUB_TOKEN"
-      },
-      "description": "GitHub operations"
-    }
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "mcp_servers": {
-    "github": {
-      "enabled": true,
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "***"
-      },
-      "description": "GitHub operations"
-    }
-  }
-}
-```
-
-#### Reset MCP Tools Cache
-
-Clear cached MCP tools and persistent MCP sessions process-wide. This affects
-all threads and users in the current Gateway process. Tools are loaded again
-from configured MCP servers on the next agent run or tool lookup.
-
-```http
-POST /api/mcp/cache/reset
-```
-
-Requires an authenticated admin session.
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "MCP tools cache reset. Tools will reload on next use."
-}
-```
-
-### Skills
-
-#### List Skills
-
-Get all available skills.
-
-```http
-GET /api/skills
-```
-
-**Response:**
-```json
-{
-  "skills": [
-    {
-      "name": "pdf-processing",
-      "display_name": "PDF Processing",
-      "description": "Handle PDF documents efficiently",
-      "enabled": true,
-      "license": "MIT",
-      "path": "public/pdf-processing"
-    },
-    {
-      "name": "frontend-design",
-      "display_name": "Frontend Design",
-      "description": "Design and build frontend interfaces",
-      "enabled": false,
-      "license": "MIT",
-      "path": "public/frontend-design"
-    }
-  ]
-}
-```
-
-#### Get Skill Details
-
-```http
-GET /api/skills/{skill_name}
-```
-
-**Response:**
-```json
-{
-  "name": "pdf-processing",
-  "display_name": "PDF Processing",
-  "description": "Handle PDF documents efficiently",
-  "enabled": true,
-  "license": "MIT",
-  "path": "public/pdf-processing",
-  "allowed_tools": ["read_file", "write_file", "bash"],
-  "content": "# PDF Processing\n\nInstructions for the agent..."
-}
-```
-
-#### Enable Skill
-
-```http
-POST /api/skills/{skill_name}/enable
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Skill 'pdf-processing' enabled"
-}
-```
-
-#### Disable Skill
-
-```http
-POST /api/skills/{skill_name}/disable
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Skill 'pdf-processing' disabled"
-}
-```
-
-#### Install Skill
-
-Install a skill from a `.skill` file.
-
-```http
-POST /api/skills/install
-Content-Type: multipart/form-data
-```
-
-**Request Body:**
-- `file`: The `.skill` file to install
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Skill 'my-skill' installed successfully",
-  "skill": {
-    "name": "my-skill",
-    "display_name": "My Skill",
-    "path": "custom/my-skill"
-  }
-}
-```
-
-### File Uploads
-
-#### Upload Files
-
-Upload one or more files to a thread.
-
-```http
-POST /api/threads/{thread_id}/uploads
-Content-Type: multipart/form-data
-```
-
-**Request Body:**
-- `files`: One or more files to upload
-
-**Response:**
-```json
-{
-  "success": true,
-  "files": [
-    {
-      "filename": "document.pdf",
-      "size": 1234567,
-      "path": ".vassilflow/threads/abc123/user-data/uploads/document.pdf",
-      "virtual_path": "/mnt/user-data/uploads/document.pdf",
-      "artifact_url": "/api/threads/abc123/artifacts/mnt/user-data/uploads/document.pdf",
-      "markdown_file": "document.md",
-      "markdown_path": ".vassilflow/threads/abc123/user-data/uploads/document.md",
-      "markdown_virtual_path": "/mnt/user-data/uploads/document.md",
-      "markdown_artifact_url": "/api/threads/abc123/artifacts/mnt/user-data/uploads/document.md"
-    }
-  ],
-  "message": "Successfully uploaded 1 file(s)"
-}
-```
-
-**Supported Document Formats** (auto-converted to Markdown):
-- PDF (`.pdf`)
-- PowerPoint (`.ppt`, `.pptx`)
-- Excel (`.xls`, `.xlsx`)
-- Word (`.doc`, `.docx`)
-
-#### List Uploaded Files
-
-```http
-GET /api/threads/{thread_id}/uploads/list
-```
-
-**Response:**
-```json
-{
-  "files": [
-    {
-      "filename": "document.pdf",
-      "size": 1234567,
-      "path": ".vassilflow/threads/abc123/user-data/uploads/document.pdf",
-      "virtual_path": "/mnt/user-data/uploads/document.pdf",
-      "artifact_url": "/api/threads/abc123/artifacts/mnt/user-data/uploads/document.pdf",
-      "extension": ".pdf",
-      "modified": 1705997600.0
-    }
-  ],
-  "count": 1
-}
-```
-
-#### Delete File
-
-```http
-DELETE /api/threads/{thread_id}/uploads/{filename}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Deleted document.pdf"
-}
-```
-
-### Thread Cleanup
-
-Remove VassilFlow-managed local thread files under `{runtime_home}/threads/{thread_id}` after the LangGraph thread itself has been deleted. `runtime_home` defaults to `.vassilflow`.
-
-```http
-DELETE /api/threads/{thread_id}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "Deleted local thread data for abc123"
-}
-```
-
-**Error behavior:**
-- `422` for invalid thread IDs
-- `500` returns a generic `{"detail": "Failed to delete local thread data."}` response while full exception details stay in server logs
-
-### Artifacts
-
-#### Get Artifact
-
-Download or view an artifact generated by the agent.
-
-```http
-GET /api/threads/{thread_id}/artifacts/{path}
-```
-
-**Path Examples:**
-- `/api/threads/abc123/artifacts/mnt/user-data/outputs/result.txt`
-- `/api/threads/abc123/artifacts/mnt/user-data/uploads/document.pdf`
-
-**Query Parameters:**
-- `download` (boolean): If `true`, force download with Content-Disposition header
-
-**Response:** File content with appropriate Content-Type
-
----
-
-## Error Responses
-
-All APIs return errors in a consistent format:
-
-```json
-{
-  "detail": "Error message describing what went wrong"
-}
-```
-
-**HTTP Status Codes:**
-- `400` - Bad Request: Invalid input
-- `404` - Not Found: Resource not found
-- `422` - Validation Error: Request validation failed
-- `500` - Internal Server Error: Server-side error
-
----
-
-## Authentication
-
-VassilFlow enforces authentication for all non-public HTTP routes. Public routes are limited to health/docs metadata and these public auth endpoints:
-
-- `POST /api/v1/auth/initialize` creates the first admin account when no admin exists.
-- `POST /api/v1/auth/login/local` logs in with email/password and sets an HttpOnly `access_token` cookie.
-- `POST /api/v1/auth/register` creates a regular `user` account and sets the session cookie.
-- `POST /api/v1/auth/logout` clears the session cookie.
-- `GET /api/v1/auth/setup-status` reports whether the first admin still needs to be created.
-
-The authenticated auth endpoints are:
-
-- `GET /api/v1/auth/me` returns the current user.
-- `POST /api/v1/auth/change-password` changes password, optionally changes email during setup, increments `token_version`, and reissues the cookie.
-
-Protected state-changing requests also require the CSRF double-submit token: send the `csrf_token` cookie value as the `X-CSRF-Token` header. Login/register/initialize/logout are bootstrap auth endpoints: they are exempt from the double-submit token but still reject hostile browser `Origin` headers.
-
-User isolation is enforced from the authenticated user context:
-
-- Thread metadata is scoped by `threads_meta.user_id`; search/read/write/delete APIs only expose the current user's threads.
-- Thread files live under `{base_dir}/users/{user_id}/threads/{thread_id}/user-data/` and are exposed inside the sandbox as `/mnt/user-data/`.
-- Memory and custom agents are stored under `{base_dir}/users/{user_id}/...`.
-
-Note: MCP outbound connections can still use OAuth for configured HTTP/SSE MCP servers; that is separate from VassilFlow API authentication.
-
----
-
-## Rate Limiting
-
-No rate limiting is implemented by default. For production deployments, configure rate limiting in Nginx:
-
-```nginx
-limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
-
-location /api/ {
-    limit_req zone=api burst=20 nodelay;
-    proxy_pass http://backend;
-}
-```
-
----
-
-## Streaming Support
-
-Gateway's LangGraph-compatible API streams run events with Server-Sent Events (SSE):
-
-```http
-POST /api/langgraph/threads/{thread_id}/runs/stream
-Accept: text/event-stream
-```
-
----
-
-## SDK Usage
-
-### Python (LangGraph SDK)
+Run this Python example from an environment with `httpx` installed. It assumes an existing local account and a configured model. It prompts for credentials and performs a real model run:
 
 ```python
-from langgraph_sdk import get_client
+from getpass import getpass
 
-client = get_client(url="http://localhost:2026/api/langgraph")
+import httpx
 
-# Create thread
-thread = await client.threads.create()
+with httpx.Client(base_url="http://localhost:8001", timeout=180) as client:
+    response = client.post(
+        "/api/v1/auth/login/local",
+        data={"username": input("Email: "), "password": getpass()},
+    )
+    response.raise_for_status()
+    client.headers["X-CSRF-Token"] = client.cookies["csrf_token"]
 
-# Run agent
-async for event in client.runs.stream(
-    thread["thread_id"],
-    "lead_agent",
-    input={"messages": [{"role": "user", "content": "Hello"}]},
-    config={"configurable": {"model_name": "gpt-4"}},
-    stream_mode=["values", "messages-tuple", "custom"],
-):
-    print(event)
+    response = client.post("/api/threads", json={"assistant_id": "lead_agent"})
+    response.raise_for_status()
+    thread_id = response.json()["thread_id"]
+
+    response = client.post(
+        f"/api/threads/{thread_id}/runs/wait",
+        json={"input": {"messages": [{"role": "user", "content": "Hello"}]}},
+    )
+    response.raise_for_status()
+    print(response.json())
 ```
 
-### JavaScript/TypeScript
+`assistant_id` binds the thread to its canonical Agent identity. The default is `lead_agent`; select other available identities from `/api/agent-catalog`. A run cannot rebind an existing thread by changing metadata or runtime context. The shipped built-in product-agent registry is empty; personal agents and delegated workers are distinct concepts.
 
-```typescript
-// Using fetch for Gateway API
-const response = await fetch('/api/models');
-const data = await response.json();
-console.log(data.models);
+Use `/runs/stream` for SSE and `/runs/wait` for a completed state response. `/runs` creates a background run. Check the final run status rather than interpreting HTTP acceptance as successful agent completion. See [streaming semantics](STREAMING.md).
 
-// Create a run and stream SSE events
-const streamResponse = await fetch(`/api/langgraph/threads/${threadId}/runs/stream`, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Accept: "text/event-stream",
-  },
-  body: JSON.stringify({
-    input: { messages: [{ role: "user", content: "Hello" }] },
-    stream_mode: ["values", "messages-tuple", "custom"],
-  }),
-});
+## Compatibility limits
 
-const reader = streamResponse.body?.getReader();
-// Decode and parse SSE frames from reader in your client code.
-```
+- Supported multitask strategies are `reject`, `interrupt`, and `rollback`; `enqueue` is declared in the request schema but is not implemented.
+- `webhook`, `after_seconds`, `feedback_keys`, and `stream_resumable` are compatibility request fields without the corresponding full Platform delivery, scheduling, feedback-registration, or durable replay service. Do not build those guarantees around their presence in OpenAPI.
+- Gateway does not support the graph `events` streaming mode. Its persisted run-event endpoints are a different API.
+- Active runs and the memory stream bridge require one Gateway worker. PostgreSQL persistence does not change this limit.
 
-### cURL Examples
+## Pagination and history
 
-```bash
-# List models
-curl http://localhost:2026/api/models
+Thread search uses a JSON body with `limit` and `offset`; the current schema permits limits from 1 to 1000. Follow the actual response and pagination headers. Run and message endpoints have their own pagination contracts; they are not interchangeable with thread search.
 
-# Get MCP config
-curl http://localhost:2026/api/mcp/config
+Runs are listed newest first. Frontend history reconstruction must order runs and messages deliberately and preserve current messages if an older-page request fails. A graph checkpoint may contain only compacted context; persisted run messages supply earlier history when configured. See [summarization](summarization.md) and [replay tests](REPLAY_E2E.md).
 
-# Upload file
-curl -X POST http://localhost:2026/api/threads/abc123/uploads \
-  -F "files=@document.pdf"
+## Deletion and local files
 
-# Enable skill
-curl -X POST http://localhost:2026/api/skills/pdf-processing/enable
+Remove VassilFlow-managed local thread files through the authenticated thread deletion API, which coordinates core thread state and registered lifecycle hooks. Do not implement deletion as a direct directory removal.
 
-# Create thread and run agent
-curl -X POST http://localhost:2026/api/langgraph/threads \
-  -H "Content-Type: application/json" \
-  -d '{}'
+`runtime_home` defaults to `.vassilflow` under the caller project root; repository launchers can override it. Authenticated files are under `{runtime_home}/users/{user_id}/threads/{thread_id}/`. See [path resolution](PATH_EXAMPLES.md) and [durable lifecycle behavior](ARCHITECTURE.md).
 
-curl -X POST http://localhost:2026/api/langgraph/threads/abc123/runs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {"messages": [{"role": "user", "content": "Hello"}]},
-    "config": {
-      "recursion_limit": 100,
-      "configurable": {"model_name": "gpt-4"}
-    }
-  }'
-```
+## Route inventory
 
-> The unified Gateway path defaults `config.recursion_limit` to 100 for
-> plan-mode and subagent-heavy runs. Clients may still set
-> `config.recursion_limit` explicitly — see the [Create Run](#create-run)
-> section for details.
+Methods and paths below are the native Gateway surface. A route's presence does not bypass feature configuration, permissions, or external-service requirements.
+
+| Method | Path                                                            | Operation                           |
+| ------ | --------------------------------------------------------------- | ----------------------------------- |
+| GET    | `/api/models`                                                   | List All Models                     |
+| GET    | `/api/models/{model_name}`                                      | Get Model Details                   |
+| GET    | `/api/mcp/config`                                               | Get MCP Configuration               |
+| PUT    | `/api/mcp/config`                                               | Update MCP Configuration            |
+| POST   | `/api/mcp/cache/reset`                                          | Reset MCP Tools Cache               |
+| GET    | `/api/memory`                                                   | Get Memory Data                     |
+| DELETE | `/api/memory`                                                   | Clear All Memory Data               |
+| POST   | `/api/memory/reload`                                            | Reload Memory Data                  |
+| POST   | `/api/memory/facts`                                             | Create Memory Fact                  |
+| DELETE | `/api/memory/facts/{fact_id}`                                   | Delete Memory Fact                  |
+| PATCH  | `/api/memory/facts/{fact_id}`                                   | Patch Memory Fact                   |
+| GET    | `/api/memory/export`                                            | Export Memory Data                  |
+| POST   | `/api/memory/import`                                            | Import Memory Data                  |
+| GET    | `/api/memory/config`                                            | Get Memory Configuration            |
+| GET    | `/api/memory/status`                                            | Get Memory Status                   |
+| GET    | `/api/skills`                                                   | List All Skills                     |
+| POST   | `/api/skills/install`                                           | Install Skill                       |
+| GET    | `/api/skills/custom`                                            | List Custom Skills                  |
+| GET    | `/api/skills/custom/{skill_name}`                               | Get Custom Skill Content            |
+| PUT    | `/api/skills/custom/{skill_name}`                               | Edit Custom Skill                   |
+| DELETE | `/api/skills/custom/{skill_name}`                               | Delete Custom Skill                 |
+| GET    | `/api/skills/custom/{skill_name}/history`                       | Get Custom Skill History            |
+| POST   | `/api/skills/custom/{skill_name}/rollback`                      | Rollback Custom Skill               |
+| GET    | `/api/skills/{skill_id}`                                        | Get Skill Details                   |
+| PUT    | `/api/skills/{skill_id}`                                        | Update Skill                        |
+| GET    | `/api/threads/{thread_id}/artifacts/{path}`                     | Get Artifact File                   |
+| POST   | `/api/threads/{thread_id}/uploads`                              | Upload Files                        |
+| GET    | `/api/threads/{thread_id}/uploads/limits`                       | Get Upload Limits                   |
+| GET    | `/api/threads/{thread_id}/uploads/list`                         | List Uploaded Files                 |
+| DELETE | `/api/threads/{thread_id}/uploads/{filename}`                   | Delete Uploaded File                |
+| DELETE | `/api/threads/{thread_id}`                                      | Delete Thread Data                  |
+| PATCH  | `/api/threads/{thread_id}`                                      | Patch Thread                        |
+| GET    | `/api/threads/{thread_id}`                                      | Get Thread                          |
+| POST   | `/api/threads`                                                  | Create Thread                       |
+| POST   | `/api/threads/{thread_id}/branches`                             | Branch Thread                       |
+| POST   | `/api/threads/search`                                           | Search Threads                      |
+| GET    | `/api/threads/{thread_id}/state`                                | Get Thread State                    |
+| POST   | `/api/threads/{thread_id}/state`                                | Update Thread State                 |
+| POST   | `/api/threads/{thread_id}/compact`                              | Compact Thread                      |
+| POST   | `/api/threads/{thread_id}/history`                              | Get Thread History                  |
+| GET    | `/api/agent-catalog`                                            | List Agent Catalog                  |
+| GET    | `/api/agents`                                                   | List Agents                         |
+| POST   | `/api/agents`                                                   | Create Custom Agent                 |
+| GET    | `/api/agents/check`                                             | Check Agent Name                    |
+| GET    | `/api/agents/{name}`                                            | Get Agent                           |
+| PUT    | `/api/agents/{name}`                                            | Update Custom Agent                 |
+| DELETE | `/api/agents/{name}`                                            | Delete Custom Agent                 |
+| GET    | `/api/user-profile`                                             | Get User Profile                    |
+| PUT    | `/api/user-profile`                                             | Update User Profile                 |
+| GET    | `/api/actions`                                                  | List Actions                        |
+| GET    | `/api/actions/{action_id}`                                      | Get Action                          |
+| GET    | `/api/suggestions/config`                                       | Get Suggestions Configuration       |
+| POST   | `/api/threads/{thread_id}/suggestions`                          | Generate Follow-up Questions        |
+| GET    | `/api/channels/providers`                                       | Get Channel Providers               |
+| GET    | `/api/channels/connections`                                     | Get Channel Connections             |
+| DELETE | `/api/channels/connections/{connection_id}`                     | Disconnect Channel Connection       |
+| DELETE | `/api/channels/{provider}/runtime-config`                       | Disconnect Channel Provider Runtime |
+| POST   | `/api/channels/{provider}/runtime-config`                       | Configure Channel Provider Runtime  |
+| POST   | `/api/channels/{provider}/connect`                              | Connect Channel Provider            |
+| GET    | `/api/channels/`                                                | Get Channels Status                 |
+| POST   | `/api/channels/{name}/restart`                                  | Restart Channel                     |
+| GET    | `/api/console/stats`                                            | Console Stats                       |
+| GET    | `/api/console/runs`                                             | List Runs Across Threads            |
+| GET    | `/api/console/usage`                                            | Token Usage Over Time               |
+| POST   | `/api/assistants/search`                                        | Search Assistants                   |
+| GET    | `/api/assistants/{assistant_id}`                                | Get Assistant Compat                |
+| GET    | `/api/assistants/{assistant_id}/graph`                          | Get Assistant Graph                 |
+| GET    | `/api/assistants/{assistant_id}/schemas`                        | Get Assistant Schemas               |
+| POST   | `/api/v1/auth/login/local`                                      | Login Local                         |
+| POST   | `/api/v1/auth/register`                                         | Register                            |
+| POST   | `/api/v1/auth/logout`                                           | Logout                              |
+| POST   | `/api/v1/auth/change-password`                                  | Change Password                     |
+| GET    | `/api/v1/auth/me`                                               | Get Me                              |
+| GET    | `/api/v1/auth/setup-status`                                     | Setup Status                        |
+| POST   | `/api/v1/auth/initialize`                                       | Initialize Admin                    |
+| GET    | `/api/v1/auth/providers`                                        | List Auth Providers                 |
+| GET    | `/api/v1/auth/oauth/{provider}`                                 | Oauth Login                         |
+| GET    | `/api/v1/auth/callback/{provider}`                              | Oauth Callback                      |
+| PUT    | `/api/threads/{thread_id}/runs/{run_id}/feedback`               | Upsert Feedback                     |
+| DELETE | `/api/threads/{thread_id}/runs/{run_id}/feedback`               | Delete Run Feedback                 |
+| POST   | `/api/threads/{thread_id}/runs/{run_id}/feedback`               | Create Feedback                     |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/feedback`               | List Feedback                       |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/feedback/stats`         | Feedback Stats                      |
+| DELETE | `/api/threads/{thread_id}/runs/{run_id}/feedback/{feedback_id}` | Delete Feedback                     |
+| POST   | `/api/threads/{thread_id}/runs/regenerate/prepare`              | Prepare Regenerate Run              |
+| POST   | `/api/threads/{thread_id}/runs`                                 | Create Run                          |
+| GET    | `/api/threads/{thread_id}/runs`                                 | List Runs                           |
+| POST   | `/api/threads/{thread_id}/runs/stream`                          | Stream Run                          |
+| POST   | `/api/threads/{thread_id}/runs/wait`                            | Wait Run                            |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}`                        | Get Run                             |
+| POST   | `/api/threads/{thread_id}/runs/{run_id}/cancel`                 | Cancel Run                          |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/join`                   | Join Run                            |
+| POST   | `/api/threads/{thread_id}/runs/{run_id}/stream`                 | Stream Existing Run                 |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/stream`                 | Stream Existing Run                 |
+| GET    | `/api/threads/{thread_id}/messages`                             | List Thread Messages                |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/messages`               | List Run Messages                   |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/events`                 | List Run Events                     |
+| GET    | `/api/threads/{thread_id}/runs/{run_id}/workspace-changes`      | Get Run Workspace Changes           |
+| GET    | `/api/threads/{thread_id}/token-usage`                          | Thread Token Usage                  |
+| POST   | `/api/runs/stream`                                              | Stateless Stream                    |
+| POST   | `/api/runs/wait`                                                | Stateless Wait                      |
+| GET    | `/api/runs/{run_id}/messages`                                   | Run Messages                        |
+| GET    | `/api/runs/{run_id}/feedback`                                   | Run Feedback                        |
+| GET    | `/health`                                                       | Health Check                        |
+| GET    | `/health/ready`                                                 | Readiness Check                     |
+
+## Related guides
+
+- [Uploads and conversion](FILE_UPLOAD.md)
+- [MCP configuration](MCP_SERVER.md)
+- [Memory behavior](MEMORY_IMPROVEMENTS.md)
+- [IM channel bindings](IM_CHANNEL_CONNECTIONS.md)
+- [Authentication validation](AUTH_TEST_PLAN.md)
+
+New endpoints belong in this inventory only after their router is mounted in [app.py](../app/gateway/app.py). Regenerate the OpenAPI inventory without starting the application lifespan when a route changes, then review implementation-specific behavior separately.

@@ -2,7 +2,9 @@
 
 VassilFlow supports user-owned IM channel bindings for Telegram, Slack, Discord, Feishu/Lark, DingTalk, WeChat, and WeCom. The feature reuses the existing `channels.*` runtime configuration, so it works in local and private deployments with the same outbound transports already supported by VassilFlow.
 
-No public IP, OAuth callback URL, or provider webhook is required in this implementation.
+The implemented bot transports use outbound polling or long-lived connections; this binding flow adds no public provider webhook or OAuth callback route. Provider-specific credentials and outbound connectivity are still required.
+
+The application implementation is in [backend/app/channels](../app/channels/), with browser APIs in [channel_connections.py](../app/gateway/routers/channel_connections.py) and configuration in [channel_connections_config.py](../packages/harness/vassilflow/config/channel_connections_config.py).
 
 ## Configuration
 
@@ -115,7 +117,8 @@ For providers with an `allowed_users` allowlist (Telegram, Slack, DingTalk, WeCh
 
 ## Runtime Model
 
-Connection records live in SQL tables under `vassilflow.persistence.channel_connections`:
+Connection records use the repository in `vassilflow.persistence.channel_connections`
+([source](../packages/harness/vassilflow/persistence/channel_connections/)) and its SQL tables:
 
 - `channel_connections`: owner user, provider identity, workspace/guild/team, status, metadata.
 - `channel_oauth_states`: one-time connect codes and Telegram deep-link state.
@@ -149,6 +152,16 @@ the channel state directory.
   a dedicated secret backend is configured.
 - `allowed_users` is **not** a bind-time defense. Because connect codes are processed before the allowlist (see Connect Flow), anyone who possesses a valid code can consume it — not only allowlisted users. Bind security therefore rests entirely on the code's confidentiality: it is 128-bit random, expires after 10 minutes, is single-use, and is shown only in the initiating user's browser (never echoed back to chat). Treat connect codes like one-time passwords and do not forward them.
 - An external identity — `(provider, external account, workspace/team/guild)` — has at most one active owner. The most recent successful bind wins: connecting an identity that another VassilFlow user already holds transfers ownership and revokes the previous owner's binding (and its stored credentials). This is enforced at the database layer, so two users racing to bind the same identity cannot both end up connected.
-- Provider bot tokens remain in `channels.*` and are never returned to the browser.
-- Stored per-connection credentials are encrypted. If stored credential material cannot be decrypted, VassilFlow treats it as unavailable instead of using corrupt secrets.
 - This implementation does not add public provider callback or webhook routes.
+
+## Validation and operations
+
+From `backend/`, run the router/repository tests before validating a real bot:
+
+```bash
+uv run pytest tests/test_channel_connections_router.py tests/test_channel_connections_repository.py tests/test_channels_router.py -q
+```
+
+Then test code expiry, single-use consumption, owner transfer, unbound-message rejection, ordinary-message allowlists, and thread ownership with the configured provider. Mocked transport tests do not prove provider credentials or outbound connectivity.
+
+YAML channel settings are startup configuration; restart Gateway after changing them. The admin runtime-configuration/restart APIs provide a separate managed path. Keep exactly one Gateway worker so duplicate channel consumers are not started. See [authentication](AUTH_DESIGN.md), [API inventory](API.md), and [restart boundaries](CONFIGURATION.md).

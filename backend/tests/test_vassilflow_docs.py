@@ -44,7 +44,7 @@ def test_core_docs_use_vassilflow_runtime_contracts():
             "Set `VASSILFLOW_SANDBOX_BIND_HOST` explicitly",
         ],
         "backend/docs/SETUP.md": [
-            "**Runtime variables**: Use `VASSILFLOW_*` variables.",
+            "**Runtime variables**: Use `VASSILFLOW_*` variables for harness-specific settings.",
             "**Runtime data**: State defaults to `.vassilflow` under the project root.",
         ],
         "backend/docs/API.md": [
@@ -117,7 +117,7 @@ def test_docs_and_scripts_do_not_reintroduce_external_product_tokens():
 def test_supporting_docs_keep_vassilflow_public_imports():
     surfaces = {
         "backend/docs/GUARDRAILS.md": [
-            "aport setup --framework vassilflow",
+            "use: vassilflow.guardrails.builtin:AllowlistProvider",
             'framework="vassilflow"',
             "vassilflow.guardrails",
         ],
@@ -133,7 +133,7 @@ def test_supporting_docs_keep_vassilflow_public_imports():
         ],
         "backend/docs/MEMORY_SETTINGS_REVIEW.md": [
             "Start VassilFlow locally",
-            "backend/.vassilflow/memory.json",
+            "{runtime_home}/users/{user_id}/memory.json",
         ],
         "backend/docs/rfc-create-vassilflow-agent.md": [
             "from vassilflow.client import VassilFlowClient",

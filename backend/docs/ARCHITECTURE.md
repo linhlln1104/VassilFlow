@@ -3,7 +3,9 @@
 This document is the canonical architecture contract for the VassilFlow
 backend. It describes stable ownership and dependency boundaries rather than
 enumerating every middleware, tool, or route. Feature-specific behavior belongs
-in the linked documents at the end.
+in the linked documents at the end. Repository paths are relative to the checkout
+root; public Python imports use `vassilflow.*`. For direct source reuse, start
+with the [factory and client guide](rfc-create-vassilflow-agent.md).
 
 ## Design Goals
 
@@ -91,11 +93,11 @@ The dependency rules are:
 
 The important composition roots are:
 
-- `app/gateway/app.py` for routers, runtime services, and health;
-- `app/gateway/domain_lifecycle.py` for enabled lifecycle handlers;
+- [backend/app/gateway/app.py](../app/gateway/app.py) for routers, runtime services, and health;
+- [backend/app/gateway/domain_lifecycle.py](../app/gateway/domain_lifecycle.py) for enabled lifecycle handlers;
 - `vassilflow.config.builtin_agents` for curated Agent definitions;
 - `vassilflow.persistence.repository_registry` for operational repositories;
-- `frontend/src/components/workspace/agents/agent-chat-extension.tsx` for
+- [frontend/src/components/workspace/agents/agent-chat-extension.tsx](../../frontend/src/components/workspace/agents/agent-chat-extension.tsx) for
   reviewed chat extensions.
 
 ## Two-Plane Model
@@ -421,17 +423,17 @@ the limited dependency.
 
 ## Storage Authority
 
-| Data                                                       | Current authority                   | Important constraint                               |
-| ---------------------------------------------------------- | ----------------------------------- | -------------------------------------------------- |
-| Users, thread metadata, and configured application records | Application database                | Backend may be memory, SQLite, or PostgreSQL       |
-| LangGraph checkpoint state                                 | Configured checkpointer             | Conversation state only                            |
-| Active run and stream bridge                               | Gateway process                     | Requires one Gateway worker today                  |
-| Thread uploads, workspace, and outputs                     | User-scoped `VASSILFLOW_HOME` paths | Deleted with thread data                           |
-| Action journal                                             | User-scoped append-only repository  | Single writer                                      |
-| Optional domain data                                       | Extension-owned repositories        | No concrete project repository ships in the base  |
+| Data                                                       | Current authority                   | Important constraint                             |
+| ---------------------------------------------------------- | ----------------------------------- | ------------------------------------------------ |
+| Users, thread metadata, and configured application records | Application database                | Backend may be memory, SQLite, or PostgreSQL     |
+| LangGraph checkpoint state                                 | Configured checkpointer             | Conversation state only                          |
+| Active run and stream bridge                               | Gateway process                     | Requires one Gateway worker today                |
+| Thread uploads, workspace, and outputs                     | User-scoped `VASSILFLOW_HOME` paths | Deleted with thread data                         |
+| Action journal                                             | User-scoped append-only repository  | Single writer                                    |
+| Optional domain data                                       | Extension-owned repositories        | No concrete project repository ships in the base |
 
 Changing the application database does not migrate file-backed domain state.
-See `../../docs/PERSISTENCE.md` for deployment, backup, inventory, and migration
+See [persistence operations](../../docs/PERSISTENCE.md) for deployment, backup, inventory, and migration
 operations.
 
 ## Adding A Capability Or Agent
@@ -488,8 +490,12 @@ Do not:
 ## Operational Constraints
 
 - Gateway run and stream coordination is process-local. Keep
-  `GATEWAY_WORKERS=1` until a shared stream bridge and cross-worker run manager
-  exist.
+  `GATEWAY_WORKERS=1` and `WEB_CONCURRENCY=1` when set. Startup rejects
+  other values, including with PostgreSQL. A shared stream bridge and
+  cross-worker run manager are not yet implemented.
+- Pending memory extraction is an in-process best-effort queue; a process crash
+  can lose pending updates. Token budgets use returned provider usage and can
+  overshoot during a response or concurrent child work.
 - File-backed Action and lifecycle repositories are single-writer storage.
   Optional domain repositories must declare their own concurrency contract.
 - There is no global transaction across the application database, Action
@@ -511,19 +517,19 @@ Do not:
 
 ## Code Map
 
-| Concern                                         | Primary path                                                                         |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Gateway composition and health                  | `app/gateway/app.py`                                                                 |
-| Run lifecycle and trusted request normalization | `app/gateway/services.py`                                                            |
-| Agent product catalog                           | `app/gateway/agent_catalog.py`                                                       |
-| Canonical Agent identity and policy             | `packages/harness/vassilflow/config/agent_contract.py`                               |
-| Built-in Agent registry                         | `packages/harness/vassilflow/config/builtin_agents.py`                               |
-| Capability adapter protocol                     | `packages/harness/vassilflow/capabilities/adapter.py`                                |
-| Action contract and store                       | `packages/harness/vassilflow/actions/`                                               |
-| Thread lifecycle protocol and journal           | `packages/harness/vassilflow/runtime/thread_lifecycle.py` and `lifecycle_journal.py` |
-| Projection repair composition                   | `app/gateway/domain_repair.py`                                                       |
-| Operational repository protocol                 | `packages/harness/vassilflow/persistence/project_repository.py`                      |
-| Agent catalog UI                                | `frontend/src/core/agents/` and `frontend/src/components/workspace/agents/`          |
+| Concern                                         | Primary path                                                                                                                                                                                                                                                      |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Gateway composition and health                  | [backend/app/gateway/app.py](../app/gateway/app.py)                                                                                                                                                                                                               |
+| Run lifecycle and trusted request normalization | [backend/app/gateway/services.py](../app/gateway/services.py)                                                                                                                                                                                                     |
+| Agent product catalog                           | [backend/app/gateway/agent_catalog.py](../app/gateway/agent_catalog.py)                                                                                                                                                                                           |
+| Canonical Agent identity and policy             | [backend/packages/harness/vassilflow/config/agent_contract.py](../packages/harness/vassilflow/config/agent_contract.py)                                                                                                                                           |
+| Built-in Agent registry                         | [backend/packages/harness/vassilflow/config/builtin_agents.py](../packages/harness/vassilflow/config/builtin_agents.py)                                                                                                                                           |
+| Capability adapter protocol                     | [backend/packages/harness/vassilflow/capabilities/adapter.py](../packages/harness/vassilflow/capabilities/adapter.py)                                                                                                                                             |
+| Action contract and store                       | [backend/packages/harness/vassilflow/actions/](../packages/harness/vassilflow/actions/)                                                                                                                                                                           |
+| Thread lifecycle protocol and journal           | [backend/packages/harness/vassilflow/runtime/thread_lifecycle.py](../packages/harness/vassilflow/runtime/thread_lifecycle.py) and [backend/packages/harness/vassilflow/runtime/lifecycle_journal.py](../packages/harness/vassilflow/runtime/lifecycle_journal.py) |
+| Projection repair composition                   | [backend/app/gateway/domain_repair.py](../app/gateway/domain_repair.py)                                                                                                                                                                                           |
+| Operational repository protocol                 | [backend/packages/harness/vassilflow/persistence/project_repository.py](../packages/harness/vassilflow/persistence/project_repository.py)                                                                                                                         |
+| Agent catalog UI                                | [frontend/src/core/agents/](../../frontend/src/core/agents/) and [frontend/src/components/workspace/agents/](../../frontend/src/components/workspace/agents/)                                                                                                     |
 
 ## Related Documentation
 

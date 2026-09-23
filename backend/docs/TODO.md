@@ -1,34 +1,26 @@
-# TODO List
+# Current limits and extension work
 
-## Completed Features
+This file records architectural limits and candidate work, not a promise that a feature is scheduled. Check current source and tests before treating an item as an open defect. The canonical boundaries are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-- [x] Launch the sandbox only after the first file system or bash tool is called
-- [x] Add Clarification Process for the whole process
-- [x] Implement Context Summarization Mechanism to avoid context explosion
-- [x] Integrate MCP (Model Context Protocol) for extensible tools
-- [x] Add file upload support with automatic document conversion
-- [x] Implement automatic thread title generation
-- [x] Add Plan Mode with TodoList middleware
-- [x] Add vision model support with ViewImageMiddleware
-- [x] Skills system with SKILL.md format
-- [x] Replace `time.sleep(5)` with `asyncio.sleep()` in `packages/harness/vassilflow/tools/builtins/task_tool.py` (subagent polling)
+## Current limits
 
-## Planned Features
+- Gateway supports one worker. Active runs, stream retention, memory queueing, and several coordination services remain process-local, including with PostgreSQL.
+- Redis stream transport is declared in the schema but is not implemented. Buffered reconnection is not durable replay after process loss.
+- Some LangGraph-compatible request fields have no full Platform implementation; `enqueue` is unsupported. See [API.md](API.md).
+- Pending memory extraction is best effort and can be lost on process exit. Memory injection uses confidence ordering, not semantic retrieval.
+- Token budgets are checked from returned provider usage; they do not reserve a shared allowance before concurrent work.
+- File-backed Action/lifecycle storage requires a single writer. SQL state, filesystem state, and optional domain repositories do not share one atomic transaction.
+- A timed-out synchronous readiness probe can continue occupying a worker thread until it returns.
+- Runtime IM bot setup can persist deployment secrets in a protected local JSON file. This is distinct from encrypted per-connection credentials.
 
-- [ ] Pooling the sandbox resources to reduce the number of sandbox containers
-- [ ] Add authentication/authorization layer
-- [ ] Implement rate limiting
-- [ ] Add metrics and monitoring
-- [ ] Support for more document formats in upload
-- [ ] Skill marketplace / remote skill installation
-- [ ] Optimize async concurrency in agent hot path (IM channels multi-task scenario)
-- [ ] Replace `subprocess.run()` with `asyncio.create_subprocess_shell()` in `packages/harness/vassilflow/sandbox/local/local_sandbox.py`
-  - Replace sync `requests` with `httpx.AsyncClient` in community tools (tavily, jina_ai, firecrawl, infoquest, image_search)
-  - [x] Replace sync `model.invoke()` with async `model.ainvoke()` in title_middleware and memory updater
-  - Consider `asyncio.to_thread()` wrapper for remaining blocking file I/O
-  - For production: tune Gateway worker/runtime settings for long-running agent workloads
+## Candidate extensions
 
-## Resolved Issues
+Distributed execution requires a coordinated design for run ownership, cancellation, stream transport, scheduling, channel workers, and storage concurrency. Replacing one database or stream class alone is insufficient.
 
-- [x] Make sure that no duplicated files in `state.artifacts`
-- [x] Long thinking but with empty content (answer inside thinking process)
+Durable memory scheduling would need persisted jobs, owner-aware retries, shutdown/recovery semantics, and protection against stale updates. Semantic retrieval would need explicit ranking, scope, deletion, and injection-budget contracts.
+
+New product agents should be added through capability, policy, Action, lifecycle, repository, and frontend extension contracts. The base currently ships no Office product, project/template API, or product renderer. Generic uploads and format conversion remain available.
+
+## Already available
+
+Local authentication, OIDC, user-owned IM bindings, sandbox warm reuse, generic agent factories, shared upload/skill helpers, and glob/grep tools are implemented. Do not revive old RFC checklists that describe them as entirely unimplemented; use their current guides in [the index](README.md).

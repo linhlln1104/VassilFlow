@@ -1,121 +1,51 @@
-# Record/Replay E2E — front-back contract verification
+# Record/replay end-to-end tests
 
-Deterministic, **key-free** end-to-end checks that a backend change can't
-silently break the frontend (and vice-versa). Two complementary layers, fed by a
-single recording.
+Replay checks backend/frontend contracts using recorded model responses. Replaying does not need a provider API key; recording a new conversation makes real model calls. Test fixtures are test data and must not contain secrets or private conversation content.
 
-## Why
+## Layers
 
-The mock-based frontend e2e hand-writes the backend's JSON/SSE, so a backend
-schema or SSE change passes green ("fake green"). These layers replay a recorded
-**real** run against the **real** backend (and, for Layer 2, the real frontend),
-so contract drift turns the build red instead.
+| Layer             | Implementation                                                            | What it checks                                                             |
+| ----------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Backend golden    | [test_replay_golden.py](../tests/test_replay_golden.py)                   | Real Gateway/runtime response and SSE contracts with replayed model output |
+| Full-stack render | [frontend/tests/e2e-real-backend](../../frontend/tests/e2e-real-backend/) | Real frontend, replay Gateway, and Chromium DOM behavior                   |
 
-## The two layers
+The full-stack suite also includes seeded multi-run history scenarios. [seed_runs_router.py](../tests/seed_runs_router.py) is mounted only by the test replay setup when `VASSILFLOW_ENABLE_TEST_SEED=1`. It seeds owned runs/messages without a checkpoint so the frontend must reconstruct history from the run APIs. Do not mount this router in production.
 
-- **Layer 1 — backend golden** (`tests/test_replay_golden.py`): replays
-  fixtures through the real FastAPI gateway with `ReplayChatModel` and verifies
-  the shared agent runtime's response and event contracts.
-- **Layer 2 — full-stack render** (`frontend/tests/e2e-real-backend/`): real
-  Next.js + real gateway (replay model) + Chromium; asserts the replayed
-  auto-title and a follow-up suggestion render in the browser. Guards semantic
-  _render_. (Complementary to Layer 1 — neither subsumes the other.)
+## Run existing fixtures
 
-Layer 2 also hosts **cross-stack contract scenarios** — the dangerous class
-where a backend change silently breaks a frontend assumption and _both sides'
-unit tests stay green_. See below.
-
-## Cross-stack scenario: multi-run render order (`multi-run-order.spec.ts`)
-
-Regression guard for issue **#3352** (after context compression, refreshing a
-thread rendered history out of order). Root cause was a front-back desync:
-backend `RunManager.list_by_thread` returns runs **newest-first** (PR #2932),
-while the frontend (`core/threads/hooks.ts`) iterated runs and **prepended** each
-loaded page — inverting chronological order once the checkpoint no longer held
-the older messages. The backend ordering test was green throughout, and the
-frontend regression unit test hardcodes "backend returns newest-first" in a mock,
-so only a _real frontend against a real backend_ catches the desync.
-
-This scenario does **not** record a conversation. It uses a **test-only seeder**
-(`tests/seed_runs_router.py`, mounted on the replay gateway only when
-`VASSILFLOW_ENABLE_TEST_SEED=1`) to stand up a thread with ≥2 runs and per-run
-message events — and deliberately **no checkpoint**, which is the #3352
-precondition: it forces the frontend's per-run reload path to be the sole source
-of truth so the ordering bug becomes observable. The seeder writes through the
-gateway's own run/event stores using the request's auth context, so the real
-`list_by_thread` → `/runs/{id}/messages` → prepend path runs live. Reverting the
-#3354 frontend fix turns this spec red.
-
-## How replay works
-
-`tests/replay_provider.py::ReplayChatModel` returns recorded assistant turns keyed
-by a **normalized hash of the model caller + conversation**. The conversation is
-human / ai / tool messages — role, text, tool-call name+args; with
-`<system-reminder>`, dates, UUIDs, tmp paths stripped. The caller is the stable
-source of the model call (`lead_agent`, `middleware:title`, `suggest_agent`,
-`subagent:*`, etc.). A miss raises loudly rather than passing silently.
-
-**The system prompt is excluded from the match key.** The lead-agent system
-prompt is a living, frequently-edited implementation detail — its wording changes
-across PRs (e.g. #3195 added a "File Editing Workflow" section). Hashing it would
-make every fixture go stale and red-fail unrelated PRs the moment anyone edits the
-prompt. The conversation flow (user input → tool calls → results → answer) is the
-stable contract that identifies a recorded turn. The caller still stays in the
-key so two different model users with identical conversation text do not compete
-for the same replay bucket. (This mirrors how open-design's mock picker keys on
-the user prompt, not the system internals.) Combined with pinning skills +
-extensions empty and disabling memory/summarization
-(`tests/_replay_fixture.py::build_config_yaml`), a fixture replays the same across
-machines, days, prompt edits, and CI. Replaying needs **no API key**.
-
-A swallowed hash-miss keeps the SSE _event shapes_ identical (the gateway wraps it
-into a normal assistant error message), so the Layer-1 golden can't catch a miss
-by shape alone — it inspects `replay_provider.replay_misses()` and fails loud
-instead. Layer-2 already fails on a miss (the recorded turns never render).
-
-## Record a new scenario (needs a real key — dev machine only)
-
-Recording drives the **real frontend** so captured inputs match exactly what the
-browser sends; fixtures contain no API key.
+From the repository root, run each command in its indicated directory:
 
 ```bash
-# 1. drive the real frontend against a real-model gateway, capturing model calls
-OPENAI_API_KEY=... OPENAI_API_BASE=<openai-compatible-endpoint>/v1 \
-  VASSILFLOW_RECORD_OUT=/tmp/rec/turns.jsonl RECORD_MODEL=<model> \
-  bash -c 'cd frontend && pnpm exec playwright test -c playwright.record.config.ts'
-
-# 2. stitch the capture into a fixture
-cd backend && uv run python scripts/build_fixture_from_jsonl.py \
-  --jsonl /tmp/rec/turns.jsonl --meta /tmp/rec/turns.jsonl.meta.json \
-  --out tests/fixtures/replay/<scenario>.<mode>.json --model <model>
-
-# 3. regenerate the committed golden
-VASSILFLOW_WRITE_GOLDEN=1 PYTHONPATH=. uv run pytest tests/test_replay_golden.py
+cd backend
+uv run pytest tests/test_replay_golden.py -q
 ```
 
-## Run (no key)
+From `frontend/`, after dependencies and Playwright Chromium are installed:
 
 ```bash
-cd backend  && PYTHONPATH=. uv run pytest tests/test_replay_golden.py  # Layer 1
-cd frontend && pnpm exec playwright test -c playwright.real-backend.config.ts  # Layer 2
+pnpm exec playwright test -c playwright.real-backend.config.ts
 ```
 
-## CI
+[playwright.real-backend.config.ts](../../frontend/playwright.real-backend.config.ts) owns test-server startup. The [CI workflow](../../.github/workflows/replay-e2e.yml) runs the backend and full-stack jobs; the full-stack job uploads the Playwright report and render artifacts. It does not build a product-specific renderer.
 
-`.github/workflows/replay-e2e.yml` runs both layers on changes to **either** side
-of the contract (`frontend/**`, `backend/app/gateway/**`,
-`backend/packages/harness/**`, fixtures). Both jobs build a read-only renderer
-and expose it only through the fixed-route nginx proxy. DOM assertions are the
-gate; the rendered screenshot + Playwright HTML report are uploaded as a CI
-artifact.
+## Matching and limitations
 
-## Known limitations
+[ReplayChatModel](../tests/replay_provider.py) matches recorded assistant turns by a normalized hash of caller and conversation. Caller attribution separates lead, title, suggestions, and subagent requests. Normalization removes volatile material such as dates, UUIDs, temporary paths, and system reminders.
 
-- Visual regression baselines are OS-specific, so they are a **local dev gate
-  only** (gitignored); CI uploads the render as an artifact for human review
-  instead of hard-asserting a cross-OS baseline.
-- Fixtures are coupled to the recording-time prompt; if new
-  environment-dependent content enters the system prompt, extend the
-  normalization in `replay_provider.py` (or pin it in `build_config_yaml`).
-- Re-record a scenario if the agent graph changes how many model calls it makes
-  — the replay raises loudly on a hash miss pointing at the divergence.
+System prompts are excluded from the match key. This makes replay useful for transport/render contracts, but it cannot validate whether a changed system prompt produces good live-model behavior. [The fixture builder](../tests/_replay_fixture.py) pins test configuration and disables unrelated variable features.
+
+A missing replay match must fail the test. Gateway can turn a model exception into an ordinary error response with valid SSE shape, so backend golden tests also inspect recorded replay misses. Matching event shapes alone is insufficient.
+
+## Record and rebuild
+
+Inspect [playwright.record.config.ts](../../frontend/playwright.record.config.ts) and [build_fixture_from_jsonl.py](../scripts/build_fixture_from_jsonl.py) before recording. The recorder consumes `OPENAI_API_KEY`, `OPENAI_API_BASE`, `RECORD_MODEL`, and `VASSILFLOW_RECORD_OUT` from the environment. Set them outside committed files, then run from `frontend/`:
+
+```bash
+pnpm exec playwright test -c playwright.record.config.ts
+```
+
+Convert the recording with the fixture script's `--jsonl`, `--meta`, `--out`, and `--model` arguments. Run `uv run python scripts/build_fixture_from_jsonl.py --help` from `backend/` for current options. Review and redact the generated fixture before adding it to [tests/fixtures/replay](../tests/fixtures/replay/).
+
+To intentionally regenerate golden expectations, set `VASSILFLOW_WRITE_GOLDEN=1` for the backend golden test command and review the diff. In PowerShell, use `$env:VASSILFLOW_WRITE_GOLDEN = "1"`; in Bash, prefix the command with `VASSILFLOW_WRITE_GOLDEN=1`. Remove the variable afterward so ordinary checks cannot rewrite expectations.
+
+Re-record when the graph's model-call sequence or conversation contract changes. Visual baselines can depend on OS/rendering environment; distinguish DOM assertions from screenshot inspection in validation reports.

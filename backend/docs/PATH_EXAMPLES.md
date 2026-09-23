@@ -1,288 +1,80 @@
-# 文件路径使用示例
+# Paths and runtime storage
 
-## 三种路径类型
+Repository paths in this documentation start at the checkout root. Python imports use `vassilflow.*`; the package source is [backend/packages/harness/vassilflow](../packages/harness/vassilflow/). Gateway source is [backend/app/gateway](../app/gateway/). There is no `backend/src` package.
 
-VassilFlow 的文件上传系统返回三种不同的路径，每种路径用于不同的场景：
+## Resolve the roots first
 
-### 1. 实际文件系统路径 (path)
+The implementation is in [runtime_paths.py](../packages/harness/vassilflow/config/runtime_paths.py) and [paths.py](../packages/harness/vassilflow/config/paths.py).
 
-```
-{runtime_home}/threads/{thread_id}/user-data/uploads/document.pdf
-```
+| Setting                        | Resolution                                                                  |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| Project root                   | `VASSILFLOW_PROJECT_ROOT`, otherwise the caller's current working directory |
+| Runtime home                   | `VASSILFLOW_HOME`, otherwise `{project_root}/.vassilflow`                   |
+| Explicit `Paths(base_dir=...)` | Overrides runtime home for that `Paths` instance                            |
+| Docker host runtime home       | `VASSILFLOW_HOST_BASE_DIR`, otherwise the runtime base directory            |
+| SQLite directory               | `database.sqlite_dir`, resolved against the process working directory       |
 
-**用途：**
-- 文件在服务器文件系统中的实际位置
-- 位于 VassilFlow runtime home 下（默认新工作区为 `.vassilflow`，旧工作区可继续使用 `.vassilflow`）
-- 用于直接文件系统访问、备份、调试等
+Relative environment paths resolve against the process working directory. Prefer absolute paths in service configuration. A configured project root must already exist and be a directory.
 
-**示例：**
-```python
-# Python 代码中直接访问
-from vassilflow.config import get_paths
+The root `make dev` launcher pins the project root to the checkout and defaults runtime home to `backend/.vassilflow`. Starting Python directly from the checkout instead defaults runtime home to `.vassilflow` there. Starting directly from `backend/` defaults it to `backend/.vassilflow`. These are different directories.
 
-file_path = get_paths().sandbox_uploads_dir("abc123") / "document.pdf"
-content = file_path.read_bytes()
-```
+## Authenticated user layout
 
-### 2. 虚拟路径 (virtual_path)
-
-```
-/mnt/user-data/uploads/document.pdf
-```
-
-**用途：**
-- Agent 在沙箱环境中使用的路径
-- 沙箱系统会自动映射到实际路径
-- Agent 的所有文件操作工具都使用这个路径
-
-**示例：**
-Agent 在对话中使用：
-```python
-# Agent 使用 read_file 工具
-read_file(path="/mnt/user-data/uploads/document.pdf")
-
-# Agent 使用 bash 工具
-bash(command="cat /mnt/user-data/uploads/document.pdf")
+```text
+{runtime_home}/
+  .jwt_secret
+  users/{user_id}/
+    memory.json
+    agents/{agent_name}/
+      config.yaml
+      SOUL.md
+      memory.json
+    actions/
+    lifecycle/
+    threads/{thread_id}/
+      user-data/
+        workspace/
+        uploads/
+        outputs/
 ```
 
-### 3. HTTP 访问 URL (artifact_url)
+Use the effective authenticated owner when resolving paths. Identifiers are validated before filesystem access. `make_safe_user_id()` normalizes external identities and adds a digest when normalization is lossy. Do not replace it with a hand-written character substitution.
 
-```
-/api/threads/{thread_id}/artifacts/mnt/user-data/uploads/document.pdf
-```
+Legacy or direct calls without a user identity can use `{runtime_home}/memory.json`, `{runtime_home}/agents/{agent_name}/`, and `{runtime_home}/threads/{thread_id}/`. Those paths do not represent a signed-in user's storage.
 
-**用途：**
-- 前端通过 HTTP 访问文件
-- 用于下载、预览文件
-- 可以直接在浏览器中打开
+An absolute `memory.storage_path` overrides the default user memory file and therefore opts out of its normal per-user path separation. Personal-agent memory still uses the user/agent directory.
 
-**示例：**
-```typescript
-// 前端 TypeScript/JavaScript 代码
-const threadId = 'abc123';
-const filename = 'document.pdf';
+## Host, sandbox, and HTTP paths
 
-// 下载文件
-const downloadUrl = `/api/threads/${threadId}/artifacts/mnt/user-data/uploads/${filename}?download=true`;
-window.open(downloadUrl);
+For owner `user-123`, thread `thread-456`, and uploaded file `report.pdf`:
 
-// 在新窗口预览
-const viewUrl = `/api/threads/${threadId}/artifacts/mnt/user-data/uploads/${filename}`;
-window.open(viewUrl, '_blank');
+| Consumer           | Example                                                                         |
+| ------------------ | ------------------------------------------------------------------------------- |
+| Gateway filesystem | `{runtime_home}/users/user-123/threads/thread-456/user-data/uploads/report.pdf` |
+| Agent tool         | `/mnt/user-data/uploads/report.pdf`                                             |
+| Browser            | `/api/threads/thread-456/artifacts/mnt/user-data/uploads/report.pdf`            |
 
-// 使用 fetch API 获取
-const response = await fetch(viewUrl);
-const blob = await response.blob();
-```
+The sandbox sees `/mnt/user-data/workspace`, `/mnt/user-data/uploads`, and `/mnt/user-data/outputs`. An ACP workspace uses its separate mapping; do not assume it is the same directory as `user-data/workspace`.
 
-## 完整使用流程示例
+Use host paths only in trusted backend code. Give virtual paths to agent tools and artifact URLs to browsers. Artifact requests still require authentication and thread ownership; the URL is not a public sharing token. URL-encode dynamic path segments and use URLs returned by the upload API when available.
 
-### 场景：前端上传文件并让 Agent 处理
+## Backend example
 
-```typescript
-// 1. 前端上传文件
-async function uploadAndProcess(threadId: string, file: File) {
-  // 上传文件
-  const formData = new FormData();
-  formData.append('files', file);
-
-  const uploadResponse = await fetch(
-    `/api/threads/${threadId}/uploads`,
-    {
-      method: 'POST',
-      body: formData
-    }
-  );
-
-  const uploadData = await uploadResponse.json();
-  const fileInfo = uploadData.files[0];
-
-  console.log('文件信息：', fileInfo);
-  // {
-  //   filename: "report.pdf",
-  //   path: "{runtime_home}/threads/abc123/user-data/uploads/report.pdf",
-  //   virtual_path: "/mnt/user-data/uploads/report.pdf",
-  //   artifact_url: "/api/threads/abc123/artifacts/mnt/user-data/uploads/report.pdf",
-  //   markdown_file: "report.md",
-  //   markdown_path: "{runtime_home}/threads/abc123/user-data/uploads/report.md",
-  //   markdown_virtual_path: "/mnt/user-data/uploads/report.md",
-  //   markdown_artifact_url: "/api/threads/abc123/artifacts/mnt/user-data/uploads/report.md"
-  // }
-
-  // 2. 发送消息给 Agent
-  await sendMessage(threadId, "请分析刚上传的 PDF 文件");
-
-  // Agent 会自动看到文件列表，包含：
-  // - report.pdf (虚拟路径: /mnt/user-data/uploads/report.pdf)
-  // - report.md (虚拟路径: /mnt/user-data/uploads/report.md)
-
-  // 3. 前端可以直接访问转换后的 Markdown
-  const mdResponse = await fetch(fileInfo.markdown_artifact_url);
-  const markdownContent = await mdResponse.text();
-  console.log('Markdown 内容：', markdownContent);
-
-  // 4. 或者下载原始 PDF
-  const downloadLink = document.createElement('a');
-  downloadLink.href = fileInfo.artifact_url + '?download=true';
-  downloadLink.download = fileInfo.filename;
-  downloadLink.click();
-}
-```
-
-## 路径转换表
-
-| 场景 | 使用的路径类型 | 示例 |
-|------|---------------|------|
-| 服务器后端代码直接访问 | `path` | `{runtime_home}/threads/abc123/user-data/uploads/file.pdf` |
-| Agent 工具调用 | `virtual_path` | `/mnt/user-data/uploads/file.pdf` |
-| 前端下载/预览 | `artifact_url` | `/api/threads/abc123/artifacts/mnt/user-data/uploads/file.pdf` |
-| 备份脚本 | `path` | `{runtime_home}/threads/abc123/user-data/uploads/file.pdf` |
-| 日志记录 | `path` | `{runtime_home}/threads/abc123/user-data/uploads/file.pdf` |
-
-## 代码示例集合
-
-### Python - 后端处理
+This example assumes authorization has already established the owner and thread. It resolves a fixed filename, not an untrusted path:
 
 ```python
-from vassilflow.config import get_paths
+from vassilflow.config.paths import get_paths
 
-def process_uploaded_file(thread_id: str, filename: str):
-    # 使用实际路径
-    file_path = get_paths().sandbox_uploads_dir(thread_id) / filename
-
-    # 直接读取
-    with open(file_path, 'rb') as f:
-        content = f.read()
-
-    return content
+uploads_dir = get_paths().sandbox_uploads_dir(
+    "thread-456", user_id="user-123"
+)
+report_path = uploads_dir / "report.pdf"
 ```
 
-### JavaScript - 前端访问
+For arbitrary virtual paths, use `Paths.resolve_virtual_path()` and the Gateway's existing path/authorization helpers. Do not join user-supplied paths directly to a runtime directory.
 
-```javascript
-// 列出已上传的文件
-async function listUploadedFiles(threadId) {
-  const response = await fetch(`/api/threads/${threadId}/uploads/list`);
-  const data = await response.json();
+## Docker-outside-of-Docker
 
-  // 为每个文件创建下载链接
-  data.files.forEach(file => {
-    console.log(`文件: ${file.filename}`);
-    console.log(`下载: ${file.artifact_url}?download=true`);
-    console.log(`预览: ${file.artifact_url}`);
+When Gateway controls the host Docker daemon, the daemon resolves bind mounts on the host. Set `VASSILFLOW_HOST_BASE_DIR` to the host path corresponding to Gateway's `VASSILFLOW_HOME`. A path valid only inside Gateway is not a valid host bind-mount source. Native Windows paths must retain their drive and separators; use the supplied host-path helpers.
 
-    // 如果是文档，还有 Markdown 版本
-    if (file.markdown_artifact_url) {
-      console.log(`Markdown: ${file.markdown_artifact_url}`);
-    }
-  });
-
-  return data.files;
-}
-
-// 删除文件
-async function deleteFile(threadId, filename) {
-  const response = await fetch(
-    `/api/threads/${threadId}/uploads/${filename}`,
-    { method: 'DELETE' }
-  );
-  return response.json();
-}
-```
-
-### React 组件示例
-
-```tsx
-import React, { useState, useEffect } from 'react';
-
-interface UploadedFile {
-  filename: string;
-  size: number;
-  path: string;
-  virtual_path: string;
-  artifact_url: string;
-  extension: string;
-  modified: number;
-  markdown_artifact_url?: string;
-}
-
-function FileUploadList({ threadId }: { threadId: string }) {
-  const [files, setFiles] = useState<UploadedFile[]>([]);
-
-  useEffect(() => {
-    fetchFiles();
-  }, [threadId]);
-
-  async function fetchFiles() {
-    const response = await fetch(`/api/threads/${threadId}/uploads/list`);
-    const data = await response.json();
-    setFiles(data.files);
-  }
-
-  async function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
-    const fileList = event.target.files;
-    if (!fileList) return;
-
-    const formData = new FormData();
-    Array.from(fileList).forEach(file => {
-      formData.append('files', file);
-    });
-
-    await fetch(`/api/threads/${threadId}/uploads`, {
-      method: 'POST',
-      body: formData
-    });
-
-    fetchFiles(); // 刷新列表
-  }
-
-  async function handleDelete(filename: string) {
-    await fetch(`/api/threads/${threadId}/uploads/${filename}`, {
-      method: 'DELETE'
-    });
-    fetchFiles(); // 刷新列表
-  }
-
-  return (
-    <div>
-      <input type="file" multiple onChange={handleUpload} />
-
-      <ul>
-        {files.map(file => (
-          <li key={file.filename}>
-            <span>{file.filename}</span>
-            <a href={file.artifact_url} target="_blank">预览</a>
-            <a href={`${file.artifact_url}?download=true`}>下载</a>
-            {file.markdown_artifact_url && (
-              <a href={file.markdown_artifact_url} target="_blank">Markdown</a>
-            )}
-            <button onClick={() => handleDelete(file.filename)}>删除</button>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-```
-
-## 注意事项
-
-1. **路径安全性**
-   - 实际路径（`path`）包含线程 ID，确保隔离
-   - API 会验证路径，防止目录遍历攻击
-   - 前端不应直接使用 `path`，而应使用 `artifact_url`
-
-2. **Agent 使用**
-   - Agent 只能看到和使用 `virtual_path`
-   - 沙箱系统自动映射到实际路径
-   - Agent 不需要知道实际的文件系统结构
-
-3. **前端集成**
-   - 始终使用 `artifact_url` 访问文件
-   - 不要尝试直接访问文件系统路径
-   - 使用 `?download=true` 参数强制下载
-
-4. **Markdown 转换**
-   - 转换成功时，会返回额外的 `markdown_*` 字段
-   - 建议优先使用 Markdown 版本（更易处理）
-   - 原始文件始终保留
+See [uploads](FILE_UPLOAD.md), [configuration](CONFIGURATION.md), and the actual mounts in [docker/docker-compose.yaml](../../docker/docker-compose.yaml).

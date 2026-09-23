@@ -1,488 +1,69 @@
-# VassilFlow Backend
+# VassilFlow backend
 
-VassilFlow is a LangGraph-based AI super agent with sandbox execution, persistent memory, and extensible tool integration. The backend enables AI agents to execute code, browse the web, manage files, delegate tasks to subagents, and retain context across conversations - all in isolated, per-thread environments.
+VassilFlow provides a reusable agent harness and a FastAPI Gateway with an embedded LangGraph runtime. Use the source base to build new agents with shared tools, skills, memory, sandbox access, delegation, persistence, and streaming. The base ships the default lead agent and personal-agent support, with no built-in product agents or Office renderer.
 
-For a fresh clone or full-stack setup, start with the repository-level guide:
-[../docs/SETUP.md](../docs/SETUP.md). This README focuses on backend architecture
-and backend-only development.
+Start with the [backend documentation index](docs/README.md). The [architecture contract](docs/ARCHITECTURE.md) defines Agent identity, capability adapters, Actions, lifecycle hooks, readiness, and repository boundaries for future products.
 
----
+## Source layout
 
-## Architecture
-
-The base ships no built-in product Agents. The default lead Agent, personal
-Agents, and delegated workers remain available for reusable agent workflows.
-Generic capability, Action, lifecycle, and repository contracts support future
-domain extensions without shipping a domain product.
-
-When composing an agent in Python, `RuntimeFeatures(token_budget=True)` enables
-the default per-run token limits. Pass a configured `TokenBudgetMiddleware` to
-customize those limits; omitting the feature leaves it disabled.
-
-For the configured lead-agent workflow, enabling `token_budget` also applies
-the same limits independently to every delegated task. Completed child usage is
-included in the lead's budget before further tools can execute, even when
-`token_usage.enabled` is false. These are checks after model responses using
-provider usage metadata, not prepaid reservations: a response or concurrent
-children can exceed the remaining parent allowance before the next check.
-
-Gateway supports one process with one worker, including on PostgreSQL.
-`GATEWAY_WORKERS` and `WEB_CONCURRENCY`, when set, must both be `1`.
-
-The canonical backend architecture, including the Agent contract, capability
-adapter boundary, Action provenance, two-plane project model, readiness, and the
-extension sequence for future Agents, is maintained in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-```
-                        ┌──────────────────────────────────────┐
-                        │          Nginx (Port 2026)           │
-                        │      Unified reverse proxy           │
-                        └───────┬──────────────────┬───────────┘
-                                │
-            /api/langgraph/*    │    /api/* (other)
-            rewritten to /api/* │
-                                ▼
-               ┌────────────────────────────────────────┐
-               │        Gateway API (8001)              │
-               │        FastAPI REST + agent runtime    │
-               │                                        │
-               │ Models, MCP, Skills, Memory, Uploads,  │
-               │ Artifacts, Threads, Runs, Streaming    │
-               │                                        │
-               │ ┌────────────────────────────────────┐ │
-               │ │ Lead Agent                         │ │
-               │ │ Middleware Chain, Tools, Subagents │ │
-               │ └────────────────────────────────────┘ │
-               └────────────────────────────────────────┘
-```
-
-**Request Routing** (via Nginx):
-- `/api/langgraph/*` → Gateway LangGraph-compatible API - agent interactions, threads, streaming
-- `/api/*` (other) → Gateway API - models, MCP, skills, memory, artifacts, uploads, thread-local cleanup
-- `/` (non-API) → Frontend - Next.js web interface
-
----
-
-## Core Components
-
-### Lead Agent
-
-The single LangGraph agent (`lead_agent`) is the runtime entry point, created via `make_lead_agent(config)`. It combines:
-
-- **Dynamic model selection** with thinking and vision support
-- **Middleware chain** for cross-cutting concerns (9 middlewares)
-- **Tool system** with sandbox, MCP, community, and built-in tools
-- **Subagent delegation** for parallel task execution
-- **System prompt** with skills injection, memory context, and working directory guidance
-
-### Middleware Chain
-
-Middlewares execute in strict order, each handling a specific concern:
-
-| # | Middleware | Purpose |
-|---|-----------|---------|
-| 1 | **ThreadDataMiddleware** | Creates per-thread isolated directories (workspace, uploads, outputs) |
-| 2 | **UploadsMiddleware** | Injects newly uploaded files into conversation context |
-| 3 | **SandboxMiddleware** | Acquires sandbox environment for code execution |
-| 4 | **SummarizationMiddleware** | Reduces context when approaching token limits (optional) |
-| 5 | **TodoListMiddleware** | Tracks multi-step tasks in plan mode (optional) |
-| 6 | **TitleMiddleware** | Auto-generates conversation titles after first exchange |
-| 7 | **MemoryMiddleware** | Queues conversations for async memory extraction |
-| 8 | **ViewImageMiddleware** | Injects image data for vision-capable models (conditional) |
-| 9 | **ClarificationMiddleware** | Intercepts clarification requests and interrupts execution (must be last) |
-
-### Sandbox System
-
-Per-thread isolated execution with virtual path translation:
-
-- **Abstract interface**: `execute_command`, `read_file`, `write_file`, `list_dir`
-- **Providers**: `LocalSandboxProvider` (filesystem) and `AioSandboxProvider` (Docker, in community/). Async runtime paths use async sandbox lifecycle hooks so startup, readiness polling, and release do not block the event loop. `AioSandboxProvider` validates active-cache and warm-pool containers during acquire/reuse, dropping definitively dead entries so a thread can provision a fresh sandbox after an unexpected container exit while keeping `get()` as an in-memory lookup. Backend health-check failures are treated as unknown, not dead, and a container that cannot be verified during discovery is simply not adopted (acquire falls through to create instead of failing).
-- **Virtual paths**: `/mnt/user-data/{workspace,uploads,outputs}` → thread-specific physical directories
-- **Skills path**: `/mnt/skills` → `VassilFlow/skills/` directory
-- **Skills loading**: Recursively discovers nested `SKILL.md` files under `skills/{public,custom}` and preserves nested container paths
-- **File-write safety**: `str_replace` serializes read-modify-write per `(sandbox.id, path)` so isolated sandboxes keep concurrency even when virtual paths match
-- **Tools**: `bash`, `ls`, `read_file`, `write_file`, `str_replace` (`write_file` overwrites by default and exposes `append` for end-of-file writes; `bash` is disabled by default when using `LocalSandboxProvider`; use `AioSandboxProvider` for isolated shell access)
-
-### Subagent System
-
-Async task delegation with concurrent execution:
-
-- **Built-in agents**: `general-purpose` (full toolset) and `bash` (command specialist, exposed only when shell access is available)
-- **Concurrency**: Max 3 subagents per turn, 15-minute timeout
-- **Execution**: Background thread pools with status tracking and SSE events
-- **Flow**: Agent calls `task()` tool → executor runs subagent in background → polls for completion → returns result
-
-### Memory System
-
-LLM-powered persistent context retention across conversations:
-
-- **Automatic extraction**: Analyzes conversations for user context, facts, and preferences
-- **Structured storage**: User context (work, personal, top-of-mind), history, and confidence-scored facts
-- **Debounced updates**: Batches updates to minimize LLM calls (configurable wait time)
-- **System prompt injection**: Top facts + context injected into agent prompts
-- **Storage**: JSON file with mtime-based cache invalidation
-
-### Tool Ecosystem
-
-| Category | Tools |
-|----------|-------|
-| **Sandbox** | `bash`, `ls`, `read_file`, `write_file`, `str_replace` |
-| **Built-in** | `present_files`, `ask_clarification`, `view_image`, `task` (subagent) |
-| **Community** | Tavily (web search), Jina AI (web fetch), Firecrawl (scraping), fastCRW (scraping), DuckDuckGo (image search) |
-| **MCP** | Any Model Context Protocol server (stdio, SSE, HTTP transports) |
-| **Skills** | Domain-specific workflows injected via system prompt |
-
-### Gateway API
-
-FastAPI application providing REST endpoints for frontend integration:
-
-| Route | Purpose |
-|-------|---------|
-| `GET /api/models` | List available LLM models |
-| `GET/PUT /api/mcp/config` | Manage MCP server configurations |
-| `POST /api/mcp/cache/reset` | Reset cached MCP tools so they reload on next use |
-| `GET/PUT /api/skills` | List and manage skills |
-| `POST /api/skills/install` | Install skill from `.skill` archive |
-| `GET /api/memory` | Retrieve memory data |
-| `POST /api/memory/reload` | Force memory reload |
-| `GET /api/memory/config` | Memory configuration |
-| `GET /api/memory/status` | Combined config + data |
-| `GET /api/console/stats` | Read-only run/thread/token headline metrics |
-| `GET /api/console/runs` | Cross-thread run history for the current user |
-| `GET /api/console/usage` | Daily token usage and per-model cost breakdown |
-| `POST /api/threads/{id}/uploads` | Upload files (auto-converts PDF/PPT/Excel/Word to Markdown, rejects directory paths, auto-renames duplicate filenames in one request) |
-| `GET /api/threads/{id}/uploads/list` | List uploaded files |
-| `DELETE /api/threads/{id}` | Delete VassilFlow-managed local thread data after LangGraph thread deletion; unexpected failures are logged server-side and return a generic 500 detail |
-| `GET /api/threads/{id}/artifacts/{path}` | Serve generated artifacts |
-
-### IM Channels
-
-The IM bridge supports Feishu, Slack, and Telegram. Slack and Telegram still use the final `runs.wait()` response path, while Feishu now streams through `runs.stream(["messages-tuple", "values"])` and updates a single in-thread card in place.
-
-For Feishu card updates, VassilFlow stores the running card's `message_id` per inbound message and patches that same card until the run finishes, preserving the existing `OK` / `DONE` reaction flow.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) package manager
-- API keys for your chosen LLM provider
-
-### Installation
-
-```bash
-cd VassilFlow
-
-# Copy configuration files
-cp config.example.yaml config.yaml
-
-# Install backend dependencies
-cd backend
-make install
-```
-
-### Configuration
-
-Edit `config.yaml` in the project root:
-
-```yaml
-models:
-  - name: gpt-4o
-    display_name: GPT-4o
-    use: langchain_openai:ChatOpenAI
-    model: gpt-4o
-    api_key: $OPENAI_API_KEY
-    supports_thinking: false
-    supports_vision: true
-
-  - name: gpt-5-responses
-    display_name: GPT-5 (Responses API)
-    use: langchain_openai:ChatOpenAI
-    model: gpt-5
-    api_key: $OPENAI_API_KEY
-    use_responses_api: true
-    output_version: responses/v1
-    supports_vision: true
-```
-
-Set your API keys:
-
-```bash
-export OPENAI_API_KEY="your-api-key-here"
-```
-
-### Running
-
-**Full Application** (from project root):
-
-```bash
-make dev  # Starts Gateway + Frontend + Nginx
-```
-
-Access at: http://localhost:2026
-
-**Backend Only** (from backend directory):
-
-```bash
-# Gateway API + embedded agent runtime
-make dev
-```
-
-Direct access: Gateway at http://localhost:8001
-
----
-
-## Project Structure
-
-```
+```text
 backend/
-├── src/
-│   ├── agents/                  # Agent system
-│   │   ├── lead_agent/         # Main agent (factory, prompts)
-│   │   ├── middlewares/        # 9 middleware components
-│   │   ├── memory/             # Memory extraction & storage
-│   │   └── thread_state.py    # ThreadState schema
-│   ├── gateway/                # FastAPI Gateway API
-│   │   ├── app.py             # Application setup
-│   │   └── routers/           # 6 route modules
-│   ├── sandbox/                # Sandbox execution
-│   │   ├── local/             # Local filesystem provider
-│   │   ├── sandbox.py         # Abstract interface
-│   │   ├── tools.py           # bash, ls, read/write/str_replace
-│   │   └── middleware.py      # Sandbox lifecycle
-│   ├── subagents/              # Subagent delegation
-│   │   ├── builtins/          # general-purpose, bash agents
-│   │   ├── executor.py        # Background execution engine
-│   │   └── registry.py        # Agent registry
-│   ├── tools/builtins/         # Built-in tools
-│   ├── mcp/                    # MCP protocol integration
-│   ├── models/                 # Model factory
-│   ├── skills/                 # Skill discovery & loading
-│   ├── config/                 # Configuration system
-│   ├── community/              # Community tools & providers
-│   ├── reflection/             # Dynamic module loading
-│   └── utils/                  # Utilities
-├── docs/                       # Documentation
-├── tests/                      # Test suite
-├── langgraph.json              # LangGraph graph registry for tooling/Studio compatibility
-├── pyproject.toml              # Python dependencies
-├── Makefile                    # Development commands
-└── Dockerfile                  # Container build
+  app/
+    gateway/                  # HTTP APIs, authentication, runtime composition
+    channels/                 # IM integrations and user binding flows
+  packages/harness/
+    pyproject.toml            # Reusable harness package
+    vassilflow/               # Public Python import namespace
+      agents/                 # Factories, prompts, middleware, memory
+      capabilities/           # Generic capability adapter contracts
+      actions/                # Mutation provenance
+      config/                 # Configuration and runtime paths
+      runtime/                # Runs, streams, checkpoints, lifecycle
+      persistence/            # Application and repository contracts
+      sandbox/                # Sandbox interfaces, local provider, file tools
+      subagents/              # Delegated workers
+      tools/                  # Built-in tools
+      community/              # Configurable integrations and AIO provider
+      mcp/                    # MCP discovery, sessions, and tools
+      models/                 # Model adapters and factory
+      skills/                 # Skill discovery and installation
+      client.py               # Direct in-process client
+  tests/
+  docs/
 ```
 
-`langgraph.json` is not the default service entrypoint.  The scripts and Docker
-deployments run the Gateway embedded runtime; the file is kept for LangGraph
-tooling, Studio, or direct LangGraph Server compatibility.
+Application code may import `vassilflow.*`; the harness must not import `app.*`.
 
----
+## Start Gateway
 
-## Configuration
-
-### Main Configuration (`config.yaml`)
-
-Place in project root. Config values starting with `$` resolve as environment variables.
-
-Key sections:
-- `models` - LLM configurations with class paths, API keys, thinking/vision flags
-- `tools` - Tool definitions with module paths and groups
-- `tool_groups` - Logical tool groupings
-- `sandbox` - Execution environment provider
-- `skills` - Skills directory paths
-- `title` - Auto-title generation settings
-- `summarization` - Context summarization settings
-- `subagents` - Subagent system (enabled/disabled)
-- `memory` - Memory system settings (enabled, storage, debounce, facts limits)
-
-Provider note:
-- `models[*].use` references provider classes by module path (for example `langchain_openai:ChatOpenAI`).
-- If a provider module is missing, VassilFlow returns an actionable error with install guidance (for example `uv add langchain-google-genai`).
-
-### Extensions Configuration (`extensions_config.json`)
-
-MCP servers and skill states in a single file:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "enabled": true,
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {"GITHUB_TOKEN": "$GITHUB_TOKEN"},
-      "tool_call_timeout": 60
-    },
-    "secure-http": {
-      "enabled": true,
-      "type": "http",
-      "url": "https://api.example.com/mcp",
-      "oauth": {
-        "enabled": true,
-        "token_url": "https://auth.example.com/oauth/token",
-        "grant_type": "client_credentials",
-        "client_id": "$MCP_OAUTH_CLIENT_ID",
-        "client_secret": "$MCP_OAUTH_CLIENT_SECRET"
-      }
-    }
-  },
-  "skills": {
-    "pdf-processing": {"enabled": true}
-  }
-}
-```
-
-### Environment Variables
-
-- `VASSILFLOW_CONFIG_PATH` - Override config.yaml location
-- `VASSILFLOW_EXTENSIONS_CONFIG_PATH` - Override extensions_config.json location
-- Model API keys: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, etc.
-- Tool API keys: `TAVILY_API_KEY`, `GITHUB_TOKEN`, etc.
-
-### LangSmith Tracing
-
-VassilFlow has built-in [LangSmith](https://smith.langchain.com) integration for observability. When enabled, all LLM calls, agent runs, tool executions, and middleware processing are traced and visible in the LangSmith dashboard.
-
-**Setup:**
-
-1. Sign up at [smith.langchain.com](https://smith.langchain.com) and create a project.
-2. Add the following to your `.env` file in the project root:
+From the repository root, after preparing configuration:
 
 ```bash
-LANGSMITH_TRACING=true
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
-LANGSMITH_API_KEY=lsv2_pt_xxxxxxxxxxxxxxxx
-LANGSMITH_PROJECT=xxx
+cd backend
+uv sync
+uv run uvicorn app.gateway.app:app --host 127.0.0.1 --port 8001 --reload
 ```
 
-**Older LangChain variables:** The `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT`, and `LANGCHAIN_ENDPOINT` variables are also supported for backward compatibility. `LANGSMITH_*` variables take precedence when both are set.
+Gateway exposes `/health`, `/health/ready`, `/docs`, and `/openapi.json`. For the complete application, follow [setup](docs/SETUP.md); nginx on port 2026 routes frontend traffic to port 3000 and API traffic to Gateway on port 8001.
 
-### Langfuse Tracing
+Use one Gateway worker, including with PostgreSQL. `GATEWAY_WORKERS` and `WEB_CONCURRENCY`, when set, must each be `1`. Runtime-home defaults differ between direct embedding and repository launchers, and SQLite has its own directory setting; see [path resolution](docs/PATH_EXAMPLES.md).
 
-VassilFlow also supports [Langfuse](https://langfuse.com) observability for LangChain-compatible runs.
+The local sandbox runs on the host and disables bash by default. Container-backed execution is a separate provider choice. Token limits use returned provider usage and can overshoot during concurrent work; pending memory extraction is an in-process best-effort queue. The feature guides document these limits rather than promising uniform isolation or durability.
 
-Add the following to your `.env` file:
+## Build a new agent
+
+Use the [pure-argument factory](docs/rfc-create-vassilflow-agent.md) to compose a model, tools, middleware, and `RuntimeFeatures`, or use `VassilFlowClient` for configuration-driven synchronous embedding. Gateway provides authenticated HTTP/SSE and application lifecycle integration.
+
+Keep product-specific code outside the generic harness. Use the existing capability and policy contracts when adding trusted inputs, specialized tools, domain storage, and frontend extensions.
+
+## Validate changes
+
+From `backend/`:
 
 ```bash
-LANGFUSE_TRACING=true
-LANGFUSE_PUBLIC_KEY=pk-lf-xxxxxxxxxxxxxxxx
-LANGFUSE_SECRET_KEY=sk-lf-xxxxxxxxxxxxxxxx
-LANGFUSE_BASE_URL=https://cloud.langfuse.com
+uv run pytest tests/ -v
+uvx ruff check .
+uvx ruff format --check .
 ```
 
-If you are using a self-hosted Langfuse deployment, set `LANGFUSE_BASE_URL` to your Langfuse host.
-
-### Dual Provider Behavior
-
-If both LangSmith and Langfuse are enabled, VassilFlow initializes and attaches both callbacks so the same run data is reported to both systems.
-
-If a provider is explicitly enabled but required credentials are missing, or the provider callback cannot be initialized, VassilFlow raises an error when tracing is initialized during model creation instead of silently disabling tracing.
-
-**Docker:** In `docker-compose.yaml`, tracing is disabled by default (`LANGSMITH_TRACING=false`). Set `LANGSMITH_TRACING=true` and/or `LANGFUSE_TRACING=true` in your `.env`, together with the required credentials, to enable tracing in containerized deployments.
-
----
-
-## Development
-
-### Commands
-
-```bash
-make install    # Install dependencies
-make dev        # Run Gateway API + embedded agent runtime (port 8001)
-make gateway    # Run Gateway API without reload (port 8001)
-make lint       # Run linter (ruff)
-make format     # Format code (ruff)
-make detect-blocking-io  # Inventory blocking IO that may block the backend event loop
-make migrate-rev MSG="..."  # Autogenerate a new alembic revision against the live ORM models
-```
-
-### Schema Migrations
-
-VassilFlow's application tables (`runs`, `threads_meta`, `feedback`, `users`,
-`run_events`, and the `channel_*` tables) are owned by alembic. The Gateway
-runs `alembic upgrade head` automatically on startup via
-`bootstrap_schema(engine, backend=...)`, so operators do not run `alembic`
-manually in production. Bootstrap is concurrency-safe (Postgres advisory lock
-across processes; per-engine `asyncio.Lock` inside one SQLite process) and
-idempotent against pre-existing schemas (empty / pre-alembic / versioned).
-
-When you add or change an ORM model, ship the change as a new revision under
-`packages/harness/vassilflow/persistence/migrations/versions/`:
-
-```bash
-make migrate-rev MSG="add foo column to runs"
-```
-
-The target invokes `scripts/_autogen_revision.py`, which builds a fresh temp
-SQLite at `head` and diffs the live models against it — so a clean checkout
-does not need a pre-existing persistent SQLite file. Review the generated file
-and switch raw `op.add_column` / `op.drop_column` calls to the idempotent
-helpers in `migrations/_helpers.py` before committing. There is no
-`make migrate` / `make migrate-stamp` target on purpose — Gateway startup is
-the only execution path, which keeps operational mistakes off the table. See
-`backend/CLAUDE.md` (Schema Migrations) for the full design.
-
-### Code Style
-
-- **Linter/Formatter**: `ruff`
-- **Line length**: 240 characters
-- **Python**: 3.12+ with type hints
-- **Quotes**: Double quotes
-- **Indentation**: 4 spaces
-
-### Testing
-
-```bash
-uv run pytest
-```
-
-`make detect-blocking-io` statically scans backend business code for blocking
-IO that may run on the backend event loop and is not test-coverage-bound. It
-prints a concise summary for human review and writes complete JSON findings to
-`.vassilflow/blocking-io-findings.json` at the repository root (regardless of
-whether the target is invoked from the repo root or from `backend/`). JSON
-findings include both broad IO category and review-oriented fields such as
-`priority`, `location`, `blocking_call`, `event_loop_exposure`, `reason`, and
-`code`. `priority` is a deterministic review ordering from the operation type,
-not proof of a bug. Bare-name same-file calls are resolved by function name,
-so duplicate helper names in one file can conservatively over-report async
-reachability.
-
----
-
-## Technology Stack
-
-- **LangGraph** (1.0.6+) - Agent framework and multi-agent orchestration
-- **LangChain** (1.2.3+) - LLM abstractions and tool system
-- **FastAPI** (0.115.0+) - Gateway REST API
-- **langchain-mcp-adapters** - Model Context Protocol support
-- **agent-sandbox** - Sandboxed code execution
-- **markitdown** - Multi-format document conversion
-- **tavily-python** / **firecrawl-py** - Web search and scraping
-
----
-
-## Documentation
-
-- [Full Setup Guide](../docs/SETUP.md)
-- [Configuration Guide](docs/CONFIGURATION.md)
-- [Architecture Details](docs/ARCHITECTURE.md)
-- [API Reference](docs/API.md)
-- [File Upload](docs/FILE_UPLOAD.md)
-- [Path Examples](docs/PATH_EXAMPLES.md)
-- [Context Summarization](docs/summarization.md)
-- [Plan Mode](docs/plan_mode_usage.md)
-- [Backend Setup Notes](docs/SETUP.md)
-
----
-
-## License
-
-See the [LICENSE](../LICENSE) file in the project root.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
+See [contribution guidance](CONTRIBUTING.md), [blocking I/O checks](docs/BLOCKING_IO_DETECTION.md), and [replay E2E](docs/REPLAY_E2E.md). External-service integration tests require their configured prerequisites; replay tests provide a model-key-free contract check.

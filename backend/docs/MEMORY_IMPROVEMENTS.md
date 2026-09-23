@@ -1,66 +1,56 @@
-# Memory System Improvements
+# Persistent memory
 
-This document tracks memory injection behavior and roadmap status.
+Memory stores user context, historical summaries, and individual facts for later conversations. It is separate from thread checkpoints and from conversation summarization. The implementation is in [agents/memory](../packages/harness/vassilflow/agents/memory/) and [MemoryMiddleware](../packages/harness/vassilflow/agents/middlewares/memory_middleware.py).
 
-## Status (As Of 2026-03-10)
+## Configuration
 
-Implemented in `main`:
-- Accurate token counting via `tiktoken` in `format_memory_for_injection`.
-- Facts are injected into prompt memory context.
-- Facts are ranked by confidence (descending).
-- Injection respects `max_injection_tokens` budget.
-
-Planned / not yet merged:
-- TF-IDF similarity-based fact retrieval.
-- `current_context` input for context-aware scoring.
-- Configurable similarity/confidence weights (`similarity_weight`, `confidence_weight`).
-- Middleware/runtime wiring for context-aware retrieval before each model call.
-
-## Current Behavior
-
-Function today:
-
-```python
-def format_memory_for_injection(memory_data: dict[str, Any], max_tokens: int = 2000) -> str:
+```yaml
+memory:
+  enabled: true
+  injection_enabled: true
+  storage_path: ""
+  storage_class: vassilflow.agents.memory.storage.FileMemoryStorage
+  debounce_seconds: 30
+  model_name: null
+  max_facts: 100
+  fact_confidence_threshold: 0.7
+  max_injection_tokens: 2000
+  token_counting: tiktoken
+  guaranteed_categories: [correction]
+  guaranteed_token_budget: 500
+  staleness_review_enabled: true
+  staleness_age_days: 90
+  staleness_min_candidates: 3
+  staleness_max_removals_per_cycle: 10
+  staleness_protected_categories: [correction]
 ```
 
-Current injection format:
-- `User Context` section from `user.*.summary`
-- `History` section from `history.*.summary`
-- `Facts` section from `facts[]`, sorted by confidence, appended until token budget is reached
+See [MemoryConfig](../packages/harness/vassilflow/config/memory_config.py) for exact field names and validation limits. A null memory model selects the runtime's default model; unlike title generation, memory extraction can therefore make model calls without an explicitly named memory model.
 
-Token counting:
-- Uses `tiktoken` (`cl100k_base`) when available
-- Falls back to a network-free CJK-aware character estimate if tokenizer import or encoding load fails
-  (CJK characters count as ~2 chars/token, other characters as ~4 chars/token)
+## Storage and scope
 
-## Known Gap
+Authenticated default-agent memory is `{runtime_home}/users/{user_id}/memory.json`. Personal-agent memory is under that user's `agents/{agent_name}/memory.json`. Legacy direct calls without user context can use a global file. An absolute `storage_path` overrides the normal user memory file and can share data across users; use the default owner-scoped path unless sharing is intentional.
 
-Previous versions of this document described TF-IDF/context-aware retrieval as if it were already shipped.
-That was not accurate for `main` and caused confusion.
+`FileMemoryStorage` caches by user/agent and file modification time, and saves through a temporary file followed by replacement. Its interface is `load`, `reload`, and `save`, with an explicit `user_id` keyword. A custom storage class must implement `MemoryStorage`; an invalid class configuration falls back to the file implementation with an error log.
 
-Issue reference: `#1059`
+## Extraction and queueing
 
-## Roadmap (Planned)
+Conversation processing is debounced and queued in process memory. Work is scoped to its owner and agent. Completion schedules pending work; busy workers do not spin through zero-delay timers. Timer generations prevent stale callbacks from acting as current timers, and explicit flush/cancellation paths retain scope.
 
-Planned scoring strategy:
+The queue is best effort: it is not a durable job queue, and a process crash can lose pending extraction. A completed chat response does not establish that memory has already been saved. Inspect `/api/memory/status` when validating extraction.
 
-```text
-final_score = (similarity * 0.6) + (confidence * 0.4)
-```
+The extraction prompt distinguishes user context, historical summaries, and categorized facts, including explicit corrections. Uploaded-file context is filtered so ephemeral upload paths do not become persistent memory. Model-proposed stale removals pass the configured age, candidate, removal, and protected-category checks.
 
-Planned integration shape:
-1. Extract recent conversational context from filtered user/final-assistant turns.
-2. Compute TF-IDF cosine similarity between each fact and current context.
-3. Rank by weighted score and inject under token budget.
-4. Fall back to confidence-only ranking if context is unavailable.
+## Prompt injection
 
-## Validation
+[format_memory_for_injection()](../packages/harness/vassilflow/agents/memory/prompt.py) formats sections and selects facts under token budgets. Fact selection uses confidence ordering; it does not implement semantic retrieval or query-specific vector search.
 
-Current regression coverage includes:
-- facts inclusion in memory injection output
-- confidence ordering
-- token-budget-limited fact inclusion
+Guaranteed categories are selected first within their own budget. They normally displace regular facts within the ordinary budget, and the final truncation protects the selected facts block. The effective ceiling can be additive when guaranteed content exceeds the ordinary limit; `max_injection_tokens` is not an unconditional hard cap on all injected text.
 
-Tests:
-- `backend/tests/test_memory_prompt_injection.py`
+`tiktoken` counting uses a lazy cache and falls back when encoding is unavailable; `char` uses estimation. Token estimates and model billing are different measurements.
+
+## Management APIs
+
+The authenticated memory API supports read, clear, reload, fact create/update/delete, import/export, effective configuration, and queue/status inspection. Use [API.md](API.md) and the running OpenAPI schema for bodies and scope parameters. Clearing or importing memory affects persisted state; use an isolated account for UI review.
+
+See [settings validation](MEMORY_SETTINGS_REVIEW.md), the [sample fixture](memory-settings-sample.json), and [memory behavior summary](MEMORY_IMPROVEMENTS_SUMMARY.md).
